@@ -13,7 +13,7 @@ machine-readable `=== RESULT === {"replies":[...]}` line.
 
 ```bash
 # pin a tag
-pi install git:github.com/Foxclip/pi-child-rpc@v0.1.0
+pi install git:github.com/Foxclip/pi-child-rpc@v0.1.1
 
 # try it for one invocation without installing
 pi -e git:github.com/Foxclip/pi-child-rpc
