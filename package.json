@@ -1,0 +1,21 @@
+{
+	"name": "pi-child-rpc",
+	"version": "0.1.0",
+	"description": "Pi package: skill + harness for spawning a second pi agent as a child process (RPC mode) and holding multi-turn agent-to-agent conversations",
+	"keywords": [
+		"pi-package"
+	],
+	"license": "MIT",
+	"author": "Foxclip",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Foxclip/pi-child-rpc.git"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"files": [
+		"skills",
+		"README.md"
+	]
+}
