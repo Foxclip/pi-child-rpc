@@ -25,6 +25,7 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -143,16 +144,45 @@ if (watch) {
       wlog(`[tool${event.isError ? " ERROR" : " done"}] ${event.toolName}${dur} :: ${raw.slice(0, 500).replace(/\n/g, " ⏎ ")}\n`);
     } else if (event.type === "agent_settled") wlog("[settled]\n");
   });
-  // `cmd /c start` opens a new console window using the default terminal
-  // (Windows Terminal or conhost) and detaches immediately. -NoExit keeps it
-  // open after the run so the transcript stays readable.
-  spawn(
-    "cmd.exe",
-    ["/c", "start", "pi-child", "powershell", "-NoExit", "-Command",
-     `Get-Content '${watchLog}' -Wait -Encoding utf8`],
-    { windowsHide: false, detached: true, stdio: "ignore" }
-  ).unref();
-  process.stderr.write(`[watch] activity window opened; log: ${watchLog}\n`);
+  // Open a visible window tailing the log. Mechanisms, in order:
+  //  1. Windows Terminal (`wt new-tab`): wt is a GUI app, so it works from
+  //     any context, including console-less ones (agent tool sessions). It
+  //     opens a tab in the running WT window, or a new window.
+  //  2. PowerShell Start-Process via a temp .ps1 (deterministic quoting):
+  //     Start-Process opens a new window for the child console app.
+  // NOTE: the naive `cmd /c start ...` does NOT work in console-less contexts
+  // ("not a tty"): without a console, `start` silently fails to create a
+  // visible window (or, with an unquoted title, treats it as the program).
+  const tailCmd = `Get-Content '${watchLog}' -Wait -Encoding utf8`;
+  let opened = null;
+  try {
+    const wtPath = execFileSync("where.exe", ["wt"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim().split(/\r?\n/)[0];
+    if (wtPath) {
+      spawn(wtPath, ["new-tab", "powershell", "-NoExit", "-Command", tailCmd], {
+        windowsHide: true,
+        detached: true,
+        stdio: "ignore",
+      }).unref();
+      opened = "Windows Terminal (wt new-tab)";
+    }
+  } catch { /* no wt — fall through */ }
+  if (!opened) {
+    try {
+      const ps1 = join(tmpdir(), `pi-child-watch-${process.pid}.ps1`);
+      writeFileSync(ps1, `Start-Process powershell -ArgumentList @('-NoExit','-Command','${tailCmd.replace(/'/g, "''")}')\r\n`);
+      spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ps1], {
+        windowsHide: true,
+        detached: true,
+        stdio: "ignore",
+      }).unref();
+      opened = "PowerShell Start-Process (new console window)";
+    } catch { /* fall through */ }
+  }
+  if (opened) process.stderr.write(`[watch] activity window opened via ${opened}; log: ${watchLog}\n`);
+  else process.stderr.write(`[watch] WARNING: could not open an activity window; log file: ${watchLog} (open it manually)\n`);
 }
 
 const replies = [];

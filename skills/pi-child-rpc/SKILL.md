@@ -114,7 +114,9 @@ The RPC child has **no TUI** — in RPC mode its stdout is the JSON protocol, by
 node <skill_dir>/scripts/rpc-child.mjs --watch --turn "..."
 ```
 
-It opens a detached terminal window (default terminal: Windows Terminal or conhost) tailing `pi-child-live.log` in the cwd, mirroring the child's events as they happen: message boundaries with roles, streamed text, `tool_execution_start` (name + args) and `tool_execution_end` (result, truncated; errors flagged), turn and settle markers. The window uses `-NoExit`, so the transcript stays readable after the run; the log file is kept too. The RPC control flow is unaffected — the parent still drives every turn; `--watch` only adds a mirror. (Plain alternative: launch a TUI-mode `pi` in a new window to watch/steer manually, but then the parent cannot drive it.)
+It opens a visible window tailing `pi-child-live.log` in the cwd, mirroring the child's events as they happen: message boundaries with roles, streamed text, `tool_execution_start` (name + args) and `tool_execution_end` (result, truncated; errors flagged), turn and settle markers. Window mechanism, in order: (1) **Windows Terminal** — `wt new-tab powershell -NoExit -Command "Get-Content <log> -Wait"` (wt is a GUI app, so this works from any context, including console-less agent sessions); (2) fallback **PowerShell `Start-Process`** (via a temp .ps1 for deterministic quoting) opening a new console window. The tailer uses `-NoExit`, so the transcript stays readable after the run; the log file is kept too. The RPC control flow is unaffected — the parent still drives every turn; `--watch` only adds a mirror.
+
+**Do not use `cmd /c start` for this**: in a console-less context (`not a tty`, e.g. agent tool sessions) it silently fails to create a visible window, and its first unquoted token is treated as the *program*, not the title (`start "title" prog` needs the title quoted). (Plain alternative: launch a TUI-mode `pi` in a new window to watch/steer manually, but then the parent cannot drive it.)
 
 ## Notes
 
