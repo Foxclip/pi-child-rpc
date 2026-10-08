@@ -23,8 +23,8 @@
 //
 // Run from the directory the child should work in (it inherits this cwd).
 
-import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -36,6 +36,9 @@ Options:
   --model <m>         Model for the child (default: $PI_MODEL)
   --timeout <ms>      Per-turn timeout (default: 300000 = 5 min; RpcClient's
                       own default is only 60000, too short for slow local models)
+  --watch             Open a terminal window mirroring the child's live
+                      activity (text, tool calls, results) so a human can
+                      watch it; writes pi-child-live.log in the cwd
   --keep-question-tool  Do not exclude ask_user_question (child can then block
                       on extension-UI dialogs; you must answer them)
   -h, --help          Show this help`;
@@ -47,6 +50,7 @@ let provider = process.env.PI_PROVIDER || "";
 let model = process.env.PI_MODEL || "";
 let timeoutMs = 5 * 60 * 1000;
 let keepQuestionTool = false;
+let watch = false;
 
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -54,6 +58,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--provider") provider = argv[++i];
   else if (a === "--model") model = argv[++i];
   else if (a === "--timeout") timeoutMs = Number(argv[++i]);
+  else if (a === "--watch") watch = true;
   else if (a === "--keep-question-tool") keepQuestionTool = true;
   else if (a === "-h" || a === "--help") {
     console.log(USAGE);
@@ -112,6 +117,43 @@ if (model) args.push("--model", model);
 if (!keepQuestionTool) args.push("--exclude-tools", "ask_user_question");
 
 const client = new RpcClient({ cliPath, args });
+
+// --watch: mirror the child's activity to a live log file and open a terminal
+// window that tails it. The RPC child itself has NO TUI (its stdout is the
+// JSON protocol, by design), so visibility means forwarding its events, not
+// attaching a UI. The window is opened detached and outlives this script.
+if (watch) {
+  const watchLog = join(process.cwd(), "pi-child-live.log");
+  writeFileSync(watchLog, ""); // fresh file each run
+  const wlog = (s) => {
+    try { appendFileSync(watchLog, s); } catch { /* window/log best-effort */ }
+  };
+  client.onEvent((event) => {
+    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+      wlog(event.assistantMessageEvent.delta);
+    } else if (event.type === "message_start") wlog(`\n[message: ${event.message?.role ?? "?"}]\n`);
+    else if (event.type === "message_end") wlog("\n");
+    else if (event.type === "turn_start") wlog("\n=== turn start ===\n");
+    else if (event.type === "turn_end") wlog("\n=== turn end ===\n");
+    else if (event.type === "tool_execution_start")
+      wlog(`\n[tool] ${event.toolName} ${JSON.stringify(event.args ?? {}).slice(0, 300)}\n`);
+    else if (event.type === "tool_execution_end") {
+      const raw = typeof event.result === "string" ? event.result : JSON.stringify(event.result ?? "");
+      const dur = event.durationMs !== undefined ? ` (${event.durationMs}ms)` : "";
+      wlog(`[tool${event.isError ? " ERROR" : " done"}] ${event.toolName}${dur} :: ${raw.slice(0, 500).replace(/\n/g, " ⏎ ")}\n`);
+    } else if (event.type === "agent_settled") wlog("[settled]\n");
+  });
+  // `cmd /c start` opens a new console window using the default terminal
+  // (Windows Terminal or conhost) and detaches immediately. -NoExit keeps it
+  // open after the run so the transcript stays readable.
+  spawn(
+    "cmd.exe",
+    ["/c", "start", "pi-child", "powershell", "-NoExit", "-Command",
+     `Get-Content '${watchLog}' -Wait -Encoding utf8`],
+    { windowsHide: false, detached: true, stdio: "ignore" }
+  ).unref();
+  process.stderr.write(`[watch] activity window opened; log: ${watchLog}\n`);
+}
 
 const replies = [];
 let turnText = "";

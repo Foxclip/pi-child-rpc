@@ -106,6 +106,16 @@ p.stdin.close(); p.wait()
 
 Note: do not use a generic line reader that splits on Unicode line separators (U+2028/U+2029) — split on LF only.
 
+## Watching the child (live window)
+
+The RPC child has **no TUI** — in RPC mode its stdout is the JSON protocol, by design. To watch it work, run the harness with `--watch`:
+
+```bash
+node <skill_dir>/scripts/rpc-child.mjs --watch --turn "..."
+```
+
+It opens a detached terminal window (default terminal: Windows Terminal or conhost) tailing `pi-child-live.log` in the cwd, mirroring the child's events as they happen: message boundaries with roles, streamed text, `tool_execution_start` (name + args) and `tool_execution_end` (result, truncated; errors flagged), turn and settle markers. The window uses `-NoExit`, so the transcript stays readable after the run; the log file is kept too. The RPC control flow is unaffected — the parent still drives every turn; `--watch` only adds a mirror. (Plain alternative: launch a TUI-mode `pi` in a new window to watch/steer manually, but then the parent cannot drive it.)
+
 ## Notes
 
 - The harness runs the child with `--no-session` (throwaway). Drop that flag and use `--session-dir`/`--name` if the child's session must be inspected later.
