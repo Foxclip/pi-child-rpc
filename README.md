@@ -13,7 +13,7 @@ machine-readable `=== RESULT === {"replies":[...]}` line.
 
 ```bash
 # pin a tag
-pi install git:github.com/Foxclip/pi-child-rpc@v0.1.3
+pi install git:github.com/Foxclip/pi-child-rpc@v0.1.4
 
 # try it for one invocation without installing
 pi -e git:github.com/Foxclip/pi-child-rpc
@@ -38,7 +38,9 @@ The skill's instructions cover the interfaces to choose between
 (`pi --print` / JSON / RPC / SDK) and the hard-won gotchas: model/provider
 inheritance from `PI_PROVIDER`/`PI_MODEL`, the 60s default
 `promptAndWait` timeout, and dialog tools that block on unanswered
-extension-UI requests.
+extension-UI requests. Child sessions are throwaway by default; pass
+`--session-id` (or `--session`) to persist and resume them across child
+runs, so long jobs can be continued instead of restarted.
 
 ## Requirements
 

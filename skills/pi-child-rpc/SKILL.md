@@ -36,7 +36,31 @@ Output: the child's live streamed text, then `[reply-N]` blocks, then a final ma
 === RESULT === {"replies":["...", "..."]}
 ```
 
-Parse that line for programmatic use. Exit code is non-zero on timeout or child failure. Options: `--provider`, `--model`, `--timeout <ms>`, `--keep-question-tool`, `--help`.
+Parse that line for programmatic use. Exit code is non-zero on timeout or child failure. Options: `--provider`, `--model`, `--timeout <ms>`, `--keep-question-tool`, `--session-id <id>`, `--session <path|id>`, `--session-dir <dir>`, `--name <name>`, `--help`.
+
+## Session persistence and resuming
+
+By default the harness runs the child with `--no-session` — throwaway. Nothing is saved, so there is nothing to resume. To make a job resumable, persist the session under a stable ID, and reuse that ID (from the same working directory) in later runs:
+
+```bash
+# run 1 — creates the session
+node scripts/rpc-child.mjs --session-id my-job --name "my-job" --turn "step 1..."
+
+# run 2 — later, e.g. after a timeout or crash: continues the conversation
+node scripts/rpc-child.mjs --session-id my-job --turn "continue; do step 2..."
+```
+
+Every run prints the resolved session to stderr (`[info] session id=... file=...`). Resumed turns are appended to the same transcript, so the child sees all earlier turns. `--session-id` creates the session if missing, so runs 1 and 2 use the same code path.
+To resume a session created elsewhere (e.g. a TUI run), pass its file or exact ID instead:
+
+```bash
+node scripts/rpc-child.mjs --session <path-or-exact-id> --turn "..."
+```
+
+- Sessions are stored per-project: under `~/.pi/agent/sessions/`, grouped by working directory (override with `--session-dir <dir>`). The same `--session-id` from a *different cwd* silently creates a fresh session in that project.
+- `--session` with a partial ID may open the interactive session picker, which blocks forever in RPC mode (there is no TUI). Pass the full path or full ID — from the `[info] session ...` line, or via `pi --resume` in a normal terminal.
+- Don't point a child at a session that is open in another running pi (e.g. this session's own file) — two writers on one transcript. `pi --fork <id>` makes a branch you can hand to a child instead.
+- Runtime alternative in a custom client: `client.switchSession(path)` / `client.newSession()` load a different session into an already-running child (`docs/rpc-commands.md`).
 
 ## Critical gotchas (learned the hard way — do not skip)
 
@@ -47,6 +71,7 @@ Parse that line for programmatic use. Exit code is non-zero on timeout or child 
 5. **`agent_end` ≠ done.** Retries, compaction, or queued work can follow `agent_end`; wait for `agent_settled` (the harness does this via `promptAndWait`).
 6. **The child's stdout is the protocol.** Diagnostics belong on stderr; never write non-protocol data to the child's stdin/stdout.
 7. **Windows/Node**: the child needs the pi CLI entry `dist/bundle/cli.js` of the installed package (the package `bin`), not `dist/cli.js` from a repo checkout. The harness resolves the global install automatically (`PI_PACKAGE_DIR` env overrides).
+8. **Sessions are per-project.** The same `--session-id` resolves only in the same working directory (sessions live under `~/.pi/agent/sessions`, grouped by cwd). Resuming from a different cwd silently starts a fresh session. `--session`/`--session-id` must reference an exact ID or path — partial IDs may open the interactive picker, which blocks forever in RPC mode.
 
 ## Long-running work (when a turn exceeds the timeout)
 
@@ -57,7 +82,7 @@ Mitigations:
 1. **Raise it**: `--timeout 3600000` (1 h). It is a hard wall-clock deadline, so size it to the job.
 2. **Decompose into more, smaller turns** — the interactive advantage: the parent reads each `[reply-N]`/`RESULT` line and sends the next step, so every turn gets its own budget and you can react mid-job instead of blind-waiting on one long prompt.
 3. **Custom client with an idle-based timeout** — the built-in deadline is wall-clock from prompt send, so a legitimate long tool run plus a long generation can trip it even though nothing is wrong. In a custom `RpcClient` script, reset the deadline on every incoming event (text deltas, `tool_execution_start`/`update`, `bash_execution_update`): an actively working child keeps emitting events; only a genuinely hung child (e.g. stalled provider, unanswered dialog) goes silent.
-4. **Persist the child's session** for long jobs — drop `--no-session` (add `--name`/`--session-dir`) so a timed-out or aborted job can be *resumed* in a fresh child instead of restarted from scratch.
+4. **Persist the child's session** for long jobs — pass `--session-id <id>` (plus `--name`) so a timed-out or aborted job can be *resumed* in a fresh child instead of restarted from scratch: same ID, same cwd, next turn continues the conversation (see **Session persistence and resuming**).
 
 ## Custom client (when the harness isn't enough)
 
@@ -120,7 +145,7 @@ It opens a visible window tailing `pi-child-live.log` in the cwd, mirroring the 
 
 ## Notes
 
-- The harness runs the child with `--no-session` (throwaway). Drop that flag and use `--session-dir`/`--name` if the child's session must be inspected later.
+- The harness runs the child with `--no-session` (throwaway) by default. Use `--session-id`/`--session` to persist and resume — see **Session persistence and resuming**.
 - The child is a full agent: it has `read`, `bash`, `edit`, `write` by default and can do real work. Its tool activity arrives as `tool_execution_start` events (harness prints them to stderr).
 - Credentials/config are inherited from the same config dir and environment, so a child in a pi session can use the same providers as the parent.
 - Protocol references (pi docs, in the package): `docs/rpc.md` (protocol), `docs/rpc-commands.md` (all stdin commands), `docs/json.md` (events), `docs/rpc-extension-ui.md` (dialogs), `docs/cli-integration.md` (mode overview).

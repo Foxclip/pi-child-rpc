@@ -20,6 +20,11 @@
 //   - Prints [reply-N] blocks and a final machine-readable line:
 //       === RESULT === {"replies":["...", "..."]}
 //   - Exits non-zero on timeout or child failure.
+//   - Sessions: --no-session (throwaway) by default. --session-id <id> persists
+//     the session under a stable ID (created if missing); later runs with the
+//     same ID and working directory resume the conversation. --session
+//     <path|id> resumes an existing session. --session-dir / --name pass
+//     through. The resolved session (id + file) is printed to stderr.
 //
 // Run from the directory the child should work in (it inherits this cwd).
 
@@ -42,6 +47,15 @@ Options:
                       watch it; writes pi-child-live.log in the cwd
   --keep-question-tool  Do not exclude ask_user_question (child can then block
                       on extension-UI dialogs; you must answer them)
+  --session-id <id>   Persist the child's session under this exact ID (created
+                      if missing). Later runs with the same ID and working
+                      directory resume the conversation.
+  --session <path|id> Resume an existing session file or exact session ID
+                      (e.g. from a TUI run). Mutually exclusive with
+                      --session-id.
+  --session-dir <dir> Override where sessions are stored/looked up (default:
+                      ~/.pi/agent/sessions, grouped by project/cwd)
+  --name <name>       Set the session display name (findable in pi --resume)
   -h, --help          Show this help`;
 
 const argv = process.argv.slice(2);
@@ -52,6 +66,10 @@ let model = process.env.PI_MODEL || "";
 let timeoutMs = 5 * 60 * 1000;
 let keepQuestionTool = false;
 let watch = false;
+let sessionId = "";
+let sessionRef = "";
+let sessionDir = "";
+let sessionName = "";
 
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -61,10 +79,34 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--timeout") timeoutMs = Number(argv[++i]);
   else if (a === "--watch") watch = true;
   else if (a === "--keep-question-tool") keepQuestionTool = true;
+  else if (a === "--session-id") sessionId = argv[++i];
+  else if (a === "--session") sessionRef = argv[++i];
+  else if (a === "--session-dir") sessionDir = argv[++i];
+  else if (a === "--name") sessionName = argv[++i];
   else if (a === "-h" || a === "--help") {
     console.log(USAGE);
     process.exit(0);
   } else positional.push(a);
+}
+
+for (const [flag, value] of [
+  ["--provider", provider],
+  ["--model", model],
+  ["--session-id", sessionId],
+  ["--session", sessionRef],
+  ["--session-dir", sessionDir],
+  ["--name", sessionName],
+]) {
+  if (value === undefined) {
+    console.error(`error: ${flag} requires a value`);
+    console.log(USAGE);
+    process.exit(2);
+  }
+}
+if (sessionId && sessionRef) {
+  console.error("error: --session-id and --session are mutually exclusive");
+  console.log(USAGE);
+  process.exit(2);
 }
 const prompts = turns.length > 0 ? turns : positional;
 if (prompts.some((p) => p === undefined) || prompts.length === 0) {
@@ -112,7 +154,12 @@ if (!cliPath) {
 // Import RpcClient by absolute path (works without a local node_modules).
 const { RpcClient } = await import(pathToFileURL(join(pkgDir, "dist", "index.js")).href);
 
-const args = ["--no-session"];
+const args = [];
+if (sessionId) args.push("--session-id", sessionId);
+else if (sessionRef) args.push("--session", sessionRef);
+else args.push("--no-session");
+if (sessionDir) args.push("--session-dir", sessionDir);
+if (sessionName) args.push("--name", sessionName);
 if (provider) args.push("--provider", provider);
 if (model) args.push("--model", model);
 if (!keepQuestionTool) args.push("--exclude-tools", "ask_user_question");
@@ -214,6 +261,17 @@ try {
   }
   process.stderr.write(`[info] starting child: ${cliPath} --mode rpc ${args.join(" ")}\n`);
   await client.start();
+
+  // Print the resolved session so a later run can resume it (or so a human
+  // can find the transcript). Best-effort: diagnostics only.
+  try {
+    const st = await client.getState();
+    if (st && st.sessionFile) {
+      process.stderr.write(
+        `[info] session id=${st.sessionId ?? "?"} name=${st.sessionName ?? "-"} file=${st.sessionFile}\n`
+      );
+    }
+  } catch { /* get_state failed — session info is diagnostic only */ }
 
   for (let i = 0; i < prompts.length; i++) {
     process.stdout.write(`\n--- turn ${i + 1} (parent → child) ---\n${prompts[i]}\n\n[child → parent]\n`);
