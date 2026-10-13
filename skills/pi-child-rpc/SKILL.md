@@ -12,6 +12,7 @@ A pi agent can spawn and converse with another pi agent. It is not limited to `a
 | One-shot task, final text is enough | Print mode | `pi --print "task"` (plain bash) |
 | One-shot, structured events | JSON mode | `pi --mode json "task"` |
 | Multi-turn, bidirectional | **RPC mode** | `scripts/rpc-child.mjs` in this skill, or a custom `RpcClient` script |
+| One long autonomous job, unattended | **Supervised RPC** | `scripts/supervisor.mjs` (loop/stall detection + steer→fork→stuck ladder) |
 | In-process Node/Bun, full API | SDK | `createAgentSession()` from `@earendil-works/pi-coding-agent` |
 
 If the child's job is fire-and-forget with no ongoing dialogue, `acp_delegate` is usually better: clean context, async, result saved to a file.
@@ -83,6 +84,26 @@ Mitigations:
 2. **Decompose into more, smaller turns** — the interactive advantage: the parent reads each `[reply-N]`/`RESULT` line and sends the next step, so every turn gets its own budget and you can react mid-job instead of blind-waiting on one long prompt.
 3. **Custom client with an idle-based timeout** — the built-in deadline is wall-clock from prompt send, so a legitimate long tool run plus a long generation can trip it even though nothing is wrong. In a custom `RpcClient` script, reset the deadline on every incoming event (text deltas, `tool_execution_start`/`update`, `bash_execution_update`): an actively working child keeps emitting events; only a genuinely hung child (e.g. stalled provider, unanswered dialog) goes silent.
 4. **Persist the child's session** for long jobs — pass `--session-id <id>` (plus `--name`) so a timed-out or aborted job can be *resumed* in a fresh child instead of restarted from scratch: same ID, same cwd, next turn continues the conversation (see **Session persistence and resuming**).
+
+## Supervised autonomous runs (supervisor.mjs)
+
+For **one long autonomous job** (one task, many turns, runs unattended), use `scripts/supervisor.mjs` instead of one giant `--turn`. It runs the child and supervises it against the failure modes that kill long jobs:
+
+- **Tool-call loops.** The ACP context layer (the `billion-context-pi` package) runs a `repetitionGuard` (issue #308; `acp.json` key `repetitionGuard`; defaults warn=3, abort=5, counter **per session**) that refuses the 5th consecutive byte-identical tool call and **aborts the turn**. The supervisor detects the loop itself — consecutive identical tool+args in `tool_execution_start` events — and escalates:
+  1. **L1 steer** (default budget `--max-steers 3`): inject a corrective message via `steer()` — the programmatic "please continue, different approach".
+  2. **L2 fork+retry** (default budget `--max-forks 2`): abort + `fork(before the task message)` + re-prompt with a "that approach is exhausted" note. A fork is a **new session file** — loop history discarded, and the guard's per-session counter starts clean.
+  3. **L3 give up**: `RESULT status=stuck`, exit 3.
+- **Stalls** (no events at all): `--idle-timeout` (default 300 s while the model thinks) or `--tool-timeout` (default 1800 s while one tool call is running — long builds are normal) → straight to L2; a steer cannot reach a hung LLM call.
+- **External aborts** (the guard firing at 5, or any host-side abort of the turn) are treated as recoverable: straight to L2 while fork budget remains.
+
+```bash
+node <skill_dir>/scripts/supervisor.mjs "Refactor module X to use Y; verify with the test suite"
+```
+
+- **Persists the session by default** (auto `--session-id sup-<timestamp>`, `--name` = the ID) so runs stay resumable. Every L2 fork creates a NEW session file — the RESULT line reports the **final** session (`sessionId`/`sessionFile`); resume THAT file with `rpc-child.mjs --session <file>` to continue or debug. `--no-session` for throwaway.
+- RESULT JSON: `{status: "completed"|"stuck", exitReason: completed|hard-timeout|stuck-loop|stuck-idle|aborted-external, attempts, interventions: {steers, forks, loopsSeen}, sessionId, sessionFile, finalText (≤4000 chars), elapsedMs}`. Exit codes: 0 completed, 3 stuck, 1 error, 2 usage.
+- Tuning: `--loop-threshold` (default **4** — one below the guard's default abort=5 so the steer lands first), `--max-steers`, `--max-forks`, `--idle-timeout`, `--tool-timeout`, `--timeout <min>` (hard wall clock, default 240), `--watch`, plus all harness session/model flags (`--provider`, `--model`, `--session-id`, `--session`, `--session-dir`, `--name`).
+- If you run with a custom `repetitionGuard` config, set `--loop-threshold` one below its `abort` value so L1 always wins the race.
 
 ## Custom client (when the harness isn't enough)
 

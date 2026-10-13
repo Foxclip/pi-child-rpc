@@ -1,0 +1,571 @@
+#!/usr/bin/env node
+// supervisor.mjs — run ONE long autonomous task in a child pi agent (RPC mode)
+// and supervise it: detect repetitive tool-call loops and stalls, and escalate
+// (steer → fork+retry → give up) instead of letting a watchdog kill the run.
+//
+// Why this exists:
+//   billion-context-pi's `repetitionGuard` (issue #308; acp.json key
+//   `repetitionGuard`, defaults warn=3 / abort=5, counter is PER SESSION)
+//   refuses the 5th consecutive byte-identical tool call and ABORTS THE
+//   TURN — that kills long autonomous jobs. A supervised child instead gets
+//   an escalation ladder from the supervisor:
+//     L1  steer() a corrective message (the programmatic "please continue")
+//         — fires at --loop-threshold (default 4, i.e. BEFORE the guard's
+//         abort-at-5)
+//     L2  abort + fork(before the task message) + re-prompt with a note
+//         ("start a branch from an earlier message" — loop history discarded;
+//         a fork is a NEW session, so the guard's per-session counter starts
+//         clean too)
+//     L3  give up: RESULT status=stuck, exit 3
+//   External aborts (agent_settled aborted=true not caused by the supervisor
+//   — the guard firing at 5, or any other host-side abort) are recoverable:
+//   straight to L2 while fork budget remains.
+//
+// Usage:
+//   node supervisor.mjs "task description" [options]
+//
+// Behavior:
+//   - Single prompt = one autonomous job; the child works until it settles.
+//   - Loop detection: >= --loop-threshold CONSECUTIVE identical tool calls
+//     (same tool name + same args) → escalation.
+//   - Stalls (no events at all): --idle-timeout while the model is thinking,
+//     --tool-timeout while one tool call is running → straight to L2 (a steer
+//     cannot reach a hung LLM call).
+//   - --timeout is the hard wall clock; L3 when it expires.
+//   - Sessions persist by default (auto --session-id sup-<timestamp>) so runs
+//     stay resumable. NOTE: each L2 fork creates a NEW session file — the
+//     RESULT line reports the final session (id + file); resume THAT file.
+//   - stdout: child's live text + final `=== RESULT === {json}` line (same
+//     convention as rpc-child.mjs). Diagnostics/activity on stderr.
+//   - Exit codes: 0 completed, 3 stuck, 1 error, 2 usage.
+
+import { execFileSync, spawn } from "node:child_process";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const USAGE = `Usage:
+  node supervisor.mjs "autonomous task description" [options]
+Options:
+  --task <t>            Task text (alternative to the positional argument)
+  --session-id <id>     Persist under this exact ID (default: auto sup-<timestamp>)
+  --no-session          Do not persist (throwaway run; fork retries happen in memory)
+  --session <path|id>   Resume an existing session file or exact ID and run the
+                        task on top of it (mutually exclusive with --session-id)
+  --session-dir <dir>   Override where sessions are stored/looked up
+  --name <name>         Session display name (default: the session ID)
+  --provider <p>        Provider for the child (default: $PI_PROVIDER)
+  --model <m>           Model for the child (default: $PI_MODEL)
+  --loop-threshold <n>  Consecutive identical tool calls that count as a loop
+                        (default: 4 — fires one before the host repetition
+                        guard's default abort-at-5, so the steer lands first)
+  --max-steers <n>      L1 budget: corrective steer messages (default: 3)
+  --max-forks <n>       L2 budget: abort+fork+retry attempts (default: 2)
+  --idle-timeout <sec>  No-events timeout while the model is thinking (default 300)
+  --tool-timeout <sec>  No-events timeout while one tool call is running
+                        (long builds are normal; default 1800)
+  --timeout <min>       Hard wall clock for the whole job (default: 240)
+  --watch               Open a terminal window mirroring the child's live
+                        activity (writes pi-child-live.log in the cwd)
+  --keep-question-tool  Do not exclude ask_user_question (child can then block
+                        on extension-UI dialogs; you must answer them)
+  -h, --help            Show this help`;
+
+const argv = process.argv.slice(2);
+const positional = [];
+let task = "";
+let sessionArg = "";
+let sessionRef = "";
+let noSession = false;
+let sessionDir = "";
+let sessionName = "";
+let provider = process.env.PI_PROVIDER || "";
+let model = process.env.PI_MODEL || "";
+let loopThreshold = 4;
+let maxSteers = 3;
+let maxForks = 2;
+let idleTimeoutMs = 300 * 1000;
+let toolTimeoutMs = 1800 * 1000;
+let hardTimeoutMs = 240 * 60 * 1000;
+let keepQuestionTool = false;
+let watch = false;
+
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === "--task") task = argv[++i];
+  else if (a === "--session-id") sessionArg = argv[++i];
+  else if (a === "--session") sessionRef = argv[++i];
+  else if (a === "--no-session") noSession = true;
+  else if (a === "--session-dir") sessionDir = argv[++i];
+  else if (a === "--name") sessionName = argv[++i];
+  else if (a === "--provider") provider = argv[++i];
+  else if (a === "--model") model = argv[++i];
+  else if (a === "--loop-threshold") loopThreshold = Number(argv[++i]);
+  else if (a === "--max-steers") maxSteers = Number(argv[++i]);
+  else if (a === "--max-forks") maxForks = Number(argv[++i]);
+  else if (a === "--idle-timeout") idleTimeoutMs = Number(argv[++i]) * 1000;
+  else if (a === "--tool-timeout") toolTimeoutMs = Number(argv[++i]) * 1000;
+  else if (a === "--timeout") hardTimeoutMs = Number(argv[++i]) * 60 * 1000;
+  else if (a === "--watch") watch = true;
+  else if (a === "--keep-question-tool") keepQuestionTool = true;
+  else if (a === "-h" || a === "--help") {
+    console.log(USAGE);
+    process.exit(0);
+  } else positional.push(a);
+}
+
+const prompts = positional.length > 0 ? positional : [task];
+if (!prompts.every((p) => p !== undefined && p !== "") || prompts.length === 0) {
+  console.error(USAGE);
+  process.exit(2);
+}
+task = prompts.join(" ");
+if (sessionRef && sessionArg) {
+  console.error("error: --session-id and --session are mutually exclusive");
+  console.log(USAGE);
+  process.exit(2);
+}
+if (sessionRef && noSession) {
+  console.error("error: --session and --no-session are mutually exclusive");
+  console.log(USAGE);
+  process.exit(2);
+}
+for (const [flag, value] of [
+  ["--task", task],
+  ["--session-id", sessionArg],
+  ["--session-dir", sessionDir],
+  ["--name", sessionName],
+  ["--provider", provider],
+  ["--model", model],
+  ["--loop-threshold", loopThreshold],
+  ["--max-steers", maxSteers],
+  ["--max-forks", maxForks],
+  ["--idle-timeout", idleTimeoutMs],
+  ["--tool-timeout", toolTimeoutMs],
+  ["--timeout", hardTimeoutMs],
+]) {
+  if (value === undefined || Number.isNaN(value)) {
+    console.error(`error: ${flag} requires a (numeric) value`);
+    console.log(USAGE);
+    process.exit(2);
+  }
+}
+
+// Locate the installed @earendil-works/pi-coding-agent package (same as the
+// rpc-child.mjs harness: PI_PACKAGE_DIR > npm root -g > %APPDATA%\npm).
+function resolvePackageDir() {
+  const candidates = [];
+  if (process.env.PI_PACKAGE_DIR) candidates.push(process.env.PI_PACKAGE_DIR);
+  try {
+    const root = execFileSync("npm", ["root", "-g", "--silent"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (root) candidates.push(join(root, "@earendil-works", "pi-coding-agent"));
+  } catch {
+    // npm not available — fall through
+  }
+  if (process.env.APPDATA) {
+    candidates.push(
+      join(process.env.APPDATA, "npm", "node_modules", "@earendil-works", "pi-coding-agent")
+    );
+  }
+  for (const dir of candidates) {
+    if (dir && existsSync(join(dir, "dist", "index.js"))) return dir;
+  }
+  console.error(
+    "error: could not locate @earendil-works/pi-coding-agent. " +
+      "Set PI_PACKAGE_DIR to the directory containing dist/index.js."
+  );
+  process.exit(2);
+}
+
+const pkgDir = resolvePackageDir();
+const cliPath = [join(pkgDir, "dist", "bundle", "cli.js"), join(pkgDir, "dist", "cli.js")].find(
+  (p) => existsSync(p)
+);
+if (!cliPath) {
+  console.error(`error: no cli entry found under ${pkgDir}/dist`);
+  process.exit(2);
+}
+
+const { RpcClient } = await import(pathToFileURL(join(pkgDir, "dist", "index.js")).href);
+
+// Sessions persist by default: an auto ID keeps runs resumable, and L2 forks
+// need a persisted session file anyway (in-memory forks are lost on exit).
+let sessionId = "";
+if (sessionArg) sessionId = sessionArg;
+else if (!sessionRef && !noSession) {
+  sessionId = `sup-${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}`;
+}
+
+const args = [];
+if (sessionId) args.push("--session-id", sessionId);
+else if (sessionRef) args.push("--session", sessionRef);
+else args.push("--no-session");
+if (sessionDir) args.push("--session-dir", sessionDir);
+if (sessionName) args.push("--name", sessionName);
+else if (sessionId) args.push("--name", sessionId); // auto-name = findable by ID
+if (provider) args.push("--provider", provider);
+if (model) args.push("--model", model);
+if (!keepQuestionTool) args.push("--exclude-tools", "ask_user_question");
+
+const client = new RpcClient({ cliPath, args });
+
+// ---------------------------------------------------------------------------
+// Event plumbing: every child event lands in a queue the main loop drains with
+// short ticks, so timers (idle/hard) can fire even when the child is silent.
+// ---------------------------------------------------------------------------
+const queue = [];
+let wakeFn = null;
+client.onEvent((ev) => {
+  queue.push(ev);
+  const w = wakeFn;
+  wakeFn = null;
+  if (w) w();
+});
+function nextEvent(timeoutMs) {
+  if (queue.length > 0) return Promise.resolve(queue.shift());
+  return new Promise((resolve) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      resolve(queue.length > 0 ? queue.shift() : null);
+    }, timeoutMs);
+    wakeFn = () => {
+      // onEvent pushed before calling this; a single waiter at a time.
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(queue.shift());
+    };
+  });
+}
+
+// --watch: mirror the child's activity to a live log file and open a terminal
+// window tailing it (same mechanism as rpc-child.mjs).
+if (watch) {
+  const watchLog = join(process.cwd(), "pi-child-live.log");
+  writeFileSync(watchLog, ""); // fresh file each run
+  const wlog = (s) => {
+    try { appendFileSync(watchLog, s); } catch { /* window/log best-effort */ }
+  };
+  client.onEvent((event) => {
+    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+      wlog(event.assistantMessageEvent.delta);
+    } else if (event.type === "message_start") wlog(`\n[message: ${event.message?.role ?? "?"}]\n`);
+    else if (event.type === "message_end") wlog("\n");
+    else if (event.type === "turn_start") wlog("\n=== turn start ===\n");
+    else if (event.type === "turn_end") wlog("\n=== turn end ===\n");
+    else if (event.type === "tool_execution_start")
+      wlog(`\n[tool] ${event.toolName} ${JSON.stringify(event.args ?? {}).slice(0, 300)}\n`);
+    else if (event.type === "tool_execution_end") {
+      const raw = typeof event.result === "string" ? event.result : JSON.stringify(event.result ?? "");
+      const dur = event.durationMs !== undefined ? ` (${event.durationMs}ms)` : "";
+      wlog(`[tool${event.isError ? " ERROR" : " done"}] ${event.toolName}${dur} :: ${raw.slice(0, 500).replace(/\n/g, " ⏎ ")}\n`);
+    } else if (event.type === "agent_settled") wlog("[settled]\n");
+  });
+  const tailCmd = `Get-Content '${watchLog}' -Wait -Encoding utf8`;
+  let opened = null;
+  try {
+    const wtPath = execFileSync("where.exe", ["wt"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim().split(/\r?\n/)[0];
+    if (wtPath) {
+      spawn(wtPath, ["new-tab", "powershell", "-NoExit", "-Command", tailCmd], {
+        windowsHide: true,
+        detached: true,
+        stdio: "ignore",
+      }).unref();
+      opened = "Windows Terminal (wt new-tab)";
+    }
+  } catch { /* no wt — fall through */ }
+  if (!opened) {
+    try {
+      const ps1 = join(tmpdir(), `pi-child-watch-${process.pid}.ps1`);
+      writeFileSync(ps1, `Start-Process powershell -ArgumentList @('-NoExit','-Command','${tailCmd.replace(/'/g, "''")}')\r\n`);
+      spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ps1], {
+        windowsHide: true,
+        detached: true,
+        stdio: "ignore",
+      }).unref();
+      opened = "PowerShell Start-Process (new console window)";
+    } catch { /* fall through */ }
+  }
+  process.stderr.write(
+    opened
+      ? `[watch] activity window opened via ${opened}; log: ${watchLog}\n`
+      : `[watch] WARNING: could not open an activity window; log file: ${watchLog} (open it manually)\n`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Supervision state
+// ---------------------------------------------------------------------------
+let stateSessionId = "";
+let stateSessionFile = "";
+let checkpointId = null; // entry id of the CURRENT attempt's task message
+let lastSig = null;
+let loopCount = 0;
+let pendingLoop = null; // {toolName, count} — threshold hit, escalation queued
+let toolDepth = 0;
+let lastToolName = "";
+let lastEventAt = Date.now();
+let startTs = 0;
+let attempt = 1;
+let steersUsed = 0;
+let forksUsed = 0;
+let loopsSeen = 0;
+let abortedByMe = false;
+let finalTextAcc = "";
+
+function logSup(msg) {
+  process.stderr.write(msg + "\n");
+}
+
+function handleEvent(ev) {
+  if (ev.type === "message_update" && ev.assistantMessageEvent?.type === "text_delta") {
+    process.stdout.write(ev.assistantMessageEvent.delta);
+    finalTextAcc += ev.assistantMessageEvent.delta;
+  } else if (ev.type === "tool_execution_start") {
+    toolDepth++;
+    lastToolName = ev.toolName;
+    logSup(`[child tool: ${ev.toolName}] ${JSON.stringify(ev.args ?? {}).slice(0, 200)}`);
+    const sig = ev.toolName + "\x1f" + JSON.stringify(ev.args ?? {});
+    if (sig === lastSig) loopCount++;
+    else {
+      lastSig = sig;
+      loopCount = 1;
+    }
+    if (loopCount >= loopThreshold && !pendingLoop) {
+      pendingLoop = { toolName: ev.toolName, count: loopCount };
+    }
+  } else if (ev.type === "tool_execution_end") {
+    if (toolDepth > 0) toolDepth--;
+  } else if (ev.type === "extension_ui_request") {
+    if (["select", "confirm", "input", "editor"].includes(ev.method)) {
+      logSup(
+        `[WARN] child blocked on extension-UI dialog (method=${ev.method}, id=${ev.id}); ` +
+          `it will hang until answered — use --keep-question-tool deliberately`
+      );
+    }
+  }
+}
+
+// Entry id of the last user message = checkpoint for "branch from before the
+// current attempt". Must be a user message (pi's fork requires it).
+async function findCheckpoint() {
+  try {
+    const { entries } = await client.getEntries();
+    for (let i = (entries?.length ?? 0) - 1; i >= 0; i--) {
+      const e = entries[i];
+      if (e && e.type === "message" && e.message && e.message.role === "user") return e.id;
+    }
+  } catch (e) {
+    logSup(`[supervisor] getEntries failed: ${e.message}`);
+  }
+  return null;
+}
+
+async function doSteer(pl) {
+  steersUsed++;
+  loopsSeen++;
+  pendingLoop = null;
+  lastSig = null;
+  loopCount = 0;
+  const msg =
+    `You are repeating yourself: the tool call \`${pl.toolName}\` with the same arguments has ` +
+    `now occurred ${pl.count} times in a row without progress. Stop. Reassess the situation, ` +
+    `pick a DIFFERENT concrete next step, and continue with the original task. Do not repeat ` +
+    `that failing call; if the task cannot proceed, say exactly where it is blocked.`;
+  logSup(`[supervisor] L1 steer #${steersUsed}/${maxSteers}: loop on ${pl.toolName} x${pl.count}`);
+  const disp = await client.steer(msg);
+  logSup(`[supervisor] steer disposition=${disp}`);
+}
+
+// L2: abort + fork(before the task message) + re-prompt. The fork creates a NEW
+// session file whose context ends right before the current attempt — the loop
+// history is discarded, everything earlier is kept ("branch from an earlier
+// message"). If we have no checkpoint (or --no-session), degrade to abort +
+// re-prompt in the same session.
+async function doFork(reason) {
+  forksUsed++;
+  if (pendingLoop) loopsSeen++;
+  pendingLoop = null;
+  logSup(`[supervisor] L2 fork #${forksUsed}/${maxForks}: ${reason}`);
+  abortedByMe = true;
+  toolDepth = 0;
+  try {
+    await client.abort();
+  } catch (e) {
+    logSup(`[supervisor] abort warn: ${e.message}`);
+  }
+  try {
+    await client.clearQueue();
+  } catch { /* best effort */ }
+  if (checkpointId) {
+    try {
+      const r = await client.fork(checkpointId);
+      if (r && r.cancelled) logSup("[supervisor] fork cancelled by an extension; retrying in place");
+    } catch (e) {
+      logSup(`[supervisor] fork failed (${e.message}); retrying in the same session`);
+    }
+  } else {
+    logSup("[supervisor] no checkpoint available; retrying in the same session");
+  }
+  try {
+    const st = await client.getState();
+    if (st) {
+      stateSessionId = st.sessionId ?? stateSessionId;
+      stateSessionFile = st.sessionFile ?? stateSessionFile;
+    }
+  } catch { /* best effort */ }
+  logSup(`[supervisor] session now id=${stateSessionId || "?"} file=${stateSessionFile || "?"}`);
+  attempt++;
+  finalTextAcc = "";
+  const note =
+    `[supervisor] A previous attempt at this task ${reason}. That approach is exhausted — do ` +
+    `NOT repeat it. Break the work into smaller steps, verify assumptions as you go, and if ` +
+    `you cannot proceed, finish with a clear explanation of exactly where it is blocked.`;
+  await client.prompt(task + "\n\n" + note);
+  checkpointId = await findCheckpoint();
+  lastSig = null;
+  loopCount = 0;
+  toolDepth = 0;
+  lastEventAt = Date.now();
+}
+
+let exitCode = 1;
+let outcome = "error";
+try {
+  if (provider && model) {
+    logSup(`[info] child provider=${provider} model=${model}`);
+  } else {
+    logSup("[warn] no PI_PROVIDER/PI_MODEL in env; child will use configured defaults");
+  }
+  logSup(`[info] starting supervised child: ${cliPath} --mode rpc ${args.join(" ")}`);
+  logSup(
+    `[supervisor] loop-threshold=${loopThreshold} max-steers=${maxSteers} max-forks=${maxForks} ` +
+      `idle=${Math.round(idleTimeoutMs / 1000)}s tool=${Math.round(toolTimeoutMs / 1000)}s ` +
+      `hard=${Math.round(hardTimeoutMs / 60000)}min`
+  );
+  if (loopThreshold >= 5) {
+    logSup(
+      "[supervisor] NOTE: threshold >= 5 means the host repetition guard " +
+        "(default abort=5, see acp.json `repetitionGuard`) usually aborts the " +
+        "turn before your steer fires; external aborts are still recovered via fork"
+    );
+  }
+  await client.start();
+
+  try {
+    const st = await client.getState();
+    if (st) {
+      stateSessionId = st.sessionId ?? "";
+      stateSessionFile = st.sessionFile ?? "";
+    }
+  } catch { /* diagnostic only */ }
+  logSup(`[info] session id=${stateSessionId || "?"} file=${stateSessionFile || "?"}`);
+
+  startTs = Date.now();
+  lastEventAt = startTs;
+  const disp0 = await client.prompt(task);
+  logSup(`[supervisor] prompt disposition=${disp0}`);
+  checkpointId = await findCheckpoint();
+  if (!checkpointId) {
+    logSup("[supervisor] WARN: no checkpoint entry found; L2 forks will retry in place");
+  }
+
+  let settled = false;
+  while (!settled) {
+    const ev = await nextEvent(250);
+    const now = Date.now();
+    if (ev) {
+      lastEventAt = now;
+      if (ev.type === "agent_settled") {
+        if (ev.aborted) {
+          if (!abortedByMe) {
+            // External abort — most commonly the host repetition guard
+            // refusing the Nth identical call and aborting the turn.
+            // Recoverable: fork + retry (new session = fresh guard counter).
+            if (forksUsed < maxForks) {
+              await doFork(
+                "aborted mid-run by the host (repetition guard or external abort)"
+              );
+              continue;
+            }
+            outcome = "aborted-external";
+            break;
+          }
+          // Expected settle from our own abort (L2) — the new attempt is
+          // (or will be) re-prompted; keep waiting for its settle.
+        } else {
+          settled = true;
+          outcome = "completed";
+          abortedByMe = false;
+          break;
+        }
+        continue;
+      }
+      handleEvent(ev);
+    }
+    if (now - startTs > hardTimeoutMs) {
+      outcome = "hard-timeout";
+      break;
+    }
+    if (pendingLoop) {
+      if (steersUsed < maxSteers) {
+        await doSteer(pendingLoop);
+        continue;
+      }
+      if (forksUsed < maxForks) {
+        await doFork(`looped repeatedly on \`${pendingLoop.toolName}\` (${pendingLoop.count}+ identical calls in a row)`);
+        continue;
+      }
+      outcome = "stuck-loop";
+      break;
+    }
+    const inTool = toolDepth > 0;
+    const idleLimit = inTool ? toolTimeoutMs : idleTimeoutMs;
+    if (now - lastEventAt > idleLimit) {
+      const what = inTool
+        ? `no events for ${Math.round(idleLimit / 1000)}s during tool call \`${lastToolName}\``
+        : `no events for ${Math.round(idleLimit / 1000)}s (model stalled or hung)`;
+      if (forksUsed < maxForks) {
+        await doFork(`stalled (${what})`);
+        continue;
+      }
+      outcome = "stuck-idle";
+      break;
+    }
+  }
+
+  let finalText = "";
+  try {
+    finalText = (await client.getLastAssistantText())?.text ?? "";
+  } catch { /* best effort */ }
+  if (!finalText) finalText = finalTextAcc.trim();
+
+  const result = {
+    status: outcome === "completed" ? "completed" : "stuck",
+    exitReason: outcome,
+    task,
+    attempts: attempt,
+    interventions: { steers: steersUsed, forks: forksUsed, loopsSeen },
+    sessionId: stateSessionId || null,
+    sessionFile: stateSessionFile || null,
+    finalText: finalText.slice(0, 4000),
+    elapsedMs: Date.now() - startTs,
+  };
+  process.stdout.write(`\n=== RESULT === ${JSON.stringify(result)}\n`);
+  exitCode = outcome === "completed" ? 0 : 3;
+} catch (err) {
+  logSup(`\n[error] ${err.message}`);
+  exitCode = 1;
+} finally {
+  await client.stop().catch(() => {});
+}
+process.exit(exitCode);

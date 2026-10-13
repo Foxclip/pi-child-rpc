@@ -4,16 +4,22 @@ Pi package containing the **pi-child-rpc** skill: spawn a second pi agent as a
 child process (RPC mode) and hold a multi-turn, bidirectional conversation
 with it from inside a pi session.
 
-The skill bundles `scripts/rpc-child.mjs` — a ready-to-run harness that starts
-a child pi, sends your prompts one by one (each sent only after the previous
-reply settles), streams the child's live output, and ends with a
-machine-readable `=== RESULT === {"replies":[...]}` line.
+The skill bundles two ready-to-run scripts:
+
+- `scripts/rpc-child.mjs` — a harness that starts a child pi, sends your
+  prompts one by one (each sent only after the previous reply settles),
+  streams the child's live output, and ends with a machine-readable
+  `=== RESULT === {"replies":[...]}` line.
+- `scripts/supervisor.mjs` — runs **one long autonomous task** under
+  supervision: it detects repetitive tool-call loops and stalls and escalates
+  (steer → fork-from-checkpoint → give up) instead of letting the host
+  repetition guard abort the run.
 
 ## Install
 
 ```bash
 # pin a tag
-pi install git:github.com/Foxclip/pi-child-rpc@v0.1.4
+pi install git:github.com/Foxclip/pi-child-rpc@v0.2.0
 
 # try it for one invocation without installing
 pi -e git:github.com/Foxclip/pi-child-rpc
@@ -32,6 +38,9 @@ node <skill>/scripts/rpc-child.mjs "Explain this repository in one paragraph"
 node <skill>/scripts/rpc-child.mjs \
   --turn "Introduce yourself and ask me one short question" \
   --turn "Now answer your own question; end with FINISHED"
+
+# one long autonomous job, supervised (loop/stall detection + recovery)
+node <skill>/scripts/supervisor.mjs "Refactor module X to use Y; verify with the test suite"
 ```
 
 The skill's instructions cover the interfaces to choose between
