@@ -95,14 +95,20 @@ For **one long autonomous job** (one task, many turns, runs unattended), use `sc
   3. **L3 give up**: `RESULT status=stuck`, exit 3.
 - **Stalls** (no events at all): `--idle-timeout` (default 300 s while the model thinks) or `--tool-timeout` (default 1800 s while one tool call is running — long builds are normal) → straight to L2; a steer cannot reach a hung LLM call.
 - **External aborts** (the guard firing at 5, or any host-side abort of the turn) are treated as recoverable: straight to L2 while fork budget remains.
+- **Consult mode** (`--consult`) — intelligent steering by the parent session: instead of firing L1/L2 with built-in messages, the supervisor **pauses at the intervention point**. It persists the session, writes `pi-child-consult.json` (trigger, loop stats, open + last 15 completed tool calls, last assistant text, budgets, session id/file) and exits **4** with `RESULT status=consult, consultFile=...`. The child is shut down orderly (in-flight turn aborted; completed side effects stay on disk). The parent then reads the payload and re-invokes:
+  ```bash
+  node scripts/supervisor.mjs --consult-file pi-child-consult.json --action steer|fork|continue --message "your steering instruction"
+  ```
+  `steer` = send your message into the same session, in place. `fork` = branch before the task message and re-prompt task + your message (new session file, fresh guard counter — like L2, but with your note). `continue` = resume with the built-in ladder for the rest of the run. Budgets, attempt count and the hard wall clock carry across resumes (they come from the consult file, not flags). The consult file is **overwritten at each intervention** — always resume the latest one. While the child is parked, it is not running: no CPU/model cost, but also no progress.
+- **Parent-authored ladder messages** (no consult needed): `--steer-msg "<text>"` and `--fork-note "<text>"` fully replace the built-in L1/L2 messages (variables `{tool}`, `{count}` / `{reason}`). Use for task-specific guidance — the parent wrote the task, so it knows which failure modes to warn about (e.g. "the registry is blocked; use the local cache").
 
 ```bash
 node <skill_dir>/scripts/supervisor.mjs "Refactor module X to use Y; verify with the test suite"
 ```
 
 - **Persists the session by default** (auto `--session-id sup-<timestamp>`, `--name` = the ID) so runs stay resumable. Every L2 fork creates a NEW session file — the RESULT line reports the **final** session (`sessionId`/`sessionFile`); resume THAT file with `rpc-child.mjs --session <file>` to continue or debug. `--no-session` for throwaway.
-- RESULT JSON: `{status: "completed"|"stuck", exitReason: completed|hard-timeout|stuck-loop|stuck-idle|aborted-external, attempts, interventions: {steers, forks, loopsSeen}, sessionId, sessionFile, finalText (≤4000 chars), elapsedMs}`. Exit codes: 0 completed, 3 stuck, 1 error, 2 usage.
-- Tuning: `--loop-threshold` (default **4** — one below the guard's default abort=5 so the steer lands first), `--max-steers`, `--max-forks`, `--idle-timeout`, `--tool-timeout`, `--timeout <min>` (hard wall clock, default 240), `--watch`, plus all harness session/model flags (`--provider`, `--model`, `--session-id`, `--session`, `--session-dir`, `--name`).
+- RESULT JSON: `{status: "completed"|"stuck"|"consult", exitReason: completed|hard-timeout|stuck-loop|stuck-idle|aborted-external|consult-loop|consult-stall|consult-external-abort, attempts, interventions: {steers, forks, loopsSeen}, sessionId, sessionFile, finalText (≤4000 chars), elapsedMs, recentToolCalls (last 15: {tool, args, isError}), consultFile/trigger/allowedActions (status=consult only)}`. Exit codes: 0 completed, 3 stuck, **4 consult** (waiting on the parent's resume), 1 error, 2 usage.
+- Tuning: `--loop-threshold` (default **4** — one below the guard's default abort=5 so the steer lands first), `--max-steers`, `--max-forks`, `--idle-timeout`, `--tool-timeout`, `--timeout <min>` (hard wall clock, default 240), `--watch`, steering (`--consult`, `--consult-file`, `--action`, `--message`, `--steer-msg`, `--fork-note`), plus all harness session/model flags (`--provider`, `--model`, `--session-id`, `--session`, `--session-dir`, `--name`).
 - If you run with a custom `repetitionGuard` config, set `--loop-threshold` one below its `abort` value so L1 always wins the race.
 
 ## Custom client (when the harness isn't enough)

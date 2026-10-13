@@ -21,6 +21,19 @@
 //   — the guard firing at 5, or any other host-side abort) are recoverable:
 //   straight to L2 while fork budget remains.
 //
+//   Consult mode (--consult): instead of L1/L2 firing with built-in messages,
+//   the supervisor PAUSES at the intervention point: it persists the session,
+//   writes pi-child-consult.json (trigger, loop stats, recent tool calls, last
+//   assistant text, budgets, session id/file) and exits 4 with
+//   RESULT status=consult. The parent session then decides and re-invokes:
+//     node supervisor.mjs --consult-file pi-child-consult.json \
+//       --action steer|fork|continue --message "your steering instruction"
+//   steer    = send your message into the same session, in place
+//   fork     = branch before the task message + re-prompt task+message
+//              (new session file, fresh guard counter) — like L2, with your note
+//   continue = resume with the built-in ladder for the rest of the run
+//   Budgets, attempt count and the hard wall clock carry across resumes.
+//
 // Usage:
 //   node supervisor.mjs "task description" [options]
 //
@@ -37,10 +50,11 @@
 //     RESULT line reports the final session (id + file); resume THAT file.
 //   - stdout: child's live text + final `=== RESULT === {json}` line (same
 //     convention as rpc-child.mjs). Diagnostics/activity on stderr.
-//   - Exit codes: 0 completed, 3 stuck, 1 error, 2 usage.
+//   - Exit codes: 0 completed, 3 stuck, 4 consult (waiting on the parent
+//     session to resume), 1 error, 2 usage.
 
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -62,6 +76,13 @@ Options:
                         guard's default abort-at-5, so the steer lands first)
   --max-steers <n>      L1 budget: corrective steer messages (default: 3)
   --max-forks <n>       L2 budget: abort+fork+retry attempts (default: 2)
+  --steer-msg <t>       Full replacement for the built-in L1 steer message
+                        (variables: {tool}, {count})
+  --fork-note <t>       Full replacement for the built-in L2 fork re-prompt
+                        note (variable: {reason})
+  --consult             Consult mode: on an intervention, persist the session,
+                        write pi-child-consult.json and exit 4 so the parent
+                        session can steer (requires a persisted session)
   --idle-timeout <sec>  No-events timeout while the model is thinking (default 300)
   --tool-timeout <sec>  No-events timeout while one tool call is running
                         (long builds are normal; default 1800)
@@ -70,6 +91,11 @@ Options:
                         activity (writes pi-child-live.log in the cwd)
   --keep-question-tool  Do not exclude ask_user_question (child can then block
                         on extension-UI dialogs; you must answer them)
+Resume from a consult file (instead of a task):
+  --consult-file <p>    Consult file to resume from (usually
+                        pi-child-consult.json; path is in the RESULT line)
+  --action <a>          steer | fork | continue (required with --consult-file)
+  --message <t>         Parent-authored message for --action steer|fork
   -h, --help            Show this help`;
 
 const argv = process.argv.slice(2);
@@ -85,6 +111,12 @@ let model = process.env.PI_MODEL || "";
 let loopThreshold = 4;
 let maxSteers = 3;
 let maxForks = 2;
+let steerMsg = "";
+let forkNote = "";
+let consult = false;
+let consultFileArg = "";
+let resumeAction = "";
+let resumeMessage = "";
 let idleTimeoutMs = 300 * 1000;
 let toolTimeoutMs = 1800 * 1000;
 let hardTimeoutMs = 240 * 60 * 1000;
@@ -104,6 +136,12 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--loop-threshold") loopThreshold = Number(argv[++i]);
   else if (a === "--max-steers") maxSteers = Number(argv[++i]);
   else if (a === "--max-forks") maxForks = Number(argv[++i]);
+  else if (a === "--steer-msg") steerMsg = argv[++i];
+  else if (a === "--fork-note") forkNote = argv[++i];
+  else if (a === "--consult") consult = true;
+  else if (a === "--consult-file") consultFileArg = argv[++i];
+  else if (a === "--action") resumeAction = argv[++i];
+  else if (a === "--message") resumeMessage = argv[++i];
   else if (a === "--idle-timeout") idleTimeoutMs = Number(argv[++i]) * 1000;
   else if (a === "--tool-timeout") toolTimeoutMs = Number(argv[++i]) * 1000;
   else if (a === "--timeout") hardTimeoutMs = Number(argv[++i]) * 60 * 1000;
@@ -115,12 +153,58 @@ for (let i = 0; i < argv.length; i++) {
   } else positional.push(a);
 }
 
+let resumePayload = null;
+if (consultFileArg) {
+  if (positional.length > 0 || task) {
+    console.error("error: --consult-file resumes a run; do not pass a task argument");
+    process.exit(2);
+  }
+  if (sessionArg || sessionRef || noSession) {
+    console.error(
+      "error: --consult-file sets the session itself; do not pass --session-id/--session/--no-session"
+    );
+    process.exit(2);
+  }
+  if (!["steer", "fork", "continue"].includes(resumeAction)) {
+    console.error("error: --consult-file requires --action steer|fork|continue");
+    process.exit(2);
+  }
+  if (resumeAction !== "continue" && !resumeMessage) {
+    console.error("error: --action steer|fork requires --message <text>");
+    process.exit(2);
+  }
+  try {
+    resumePayload = JSON.parse(readFileSync(consultFileArg, "utf8"));
+  } catch (e) {
+    console.error(`error: cannot read consult file ${consultFileArg}: ${e.message}`);
+    process.exit(2);
+  }
+  for (const k of [
+    "task", "attempt", "steersUsed", "forksUsed", "loopsSeen",
+    "maxSteers", "maxForks", "startTs", "hardTimeoutMs", "taskEntryId",
+  ]) {
+    if (resumePayload[k] === undefined) {
+      console.error(`error: consult file missing field "${k}" — wrong or too-old file?`);
+      process.exit(2);
+    }
+  }
+  if (!resumePayload.sessionFile && !resumePayload.sessionId) {
+    console.error("error: consult file has no session to resume (sessionFile/sessionId)");
+    process.exit(2);
+  }
+  task = resumePayload.task;
+}
+
 const prompts = positional.length > 0 ? positional : [task];
 if (!prompts.every((p) => p !== undefined && p !== "") || prompts.length === 0) {
   console.error(USAGE);
   process.exit(2);
 }
 task = prompts.join(" ");
+if (consult && !resumePayload && noSession) {
+  console.error("error: --consult requires a persisted session (not --no-session)");
+  process.exit(2);
+}
 if (sessionRef && sessionArg) {
   console.error("error: --session-id and --session are mutually exclusive");
   console.log(USAGE);
@@ -195,17 +279,21 @@ const { RpcClient } = await import(pathToFileURL(join(pkgDir, "dist", "index.js"
 // Sessions persist by default: an auto ID keeps runs resumable, and L2 forks
 // need a persisted session file anyway (in-memory forks are lost on exit).
 let sessionId = "";
-if (sessionArg) sessionId = sessionArg;
-else if (!sessionRef && !noSession) {
+if (!resumePayload && sessionArg) sessionId = sessionArg;
+else if (!resumePayload && !sessionRef && !noSession) {
   sessionId = `sup-${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}`;
 }
 
 const args = [];
-if (sessionId) args.push("--session-id", sessionId);
+if (resumePayload) {
+  // Resume: the consult file pins the exact session (file path preferred —
+  // IDs only resolve per-cwd).
+  args.push("--session", resumePayload.sessionFile || resumePayload.sessionId);
+} else if (sessionId) args.push("--session-id", sessionId);
 else if (sessionRef) args.push("--session", sessionRef);
 else args.push("--no-session");
 if (sessionDir) args.push("--session-dir", sessionDir);
-if (sessionName) args.push("--name", sessionName);
+if (sessionName && !resumePayload) args.push("--name", sessionName);
 else if (sessionId) args.push("--name", sessionId); // auto-name = findable by ID
 if (provider) args.push("--provider", provider);
 if (model) args.push("--model", model);
@@ -321,9 +409,69 @@ let forksUsed = 0;
 let loopsSeen = 0;
 let abortedByMe = false;
 let finalTextAcc = "";
+let consultMode = consult;
+let consultOutFile = "";
+let consultOut = null; // last consult payload (surfaced in RESULT)
+const recentCalls = []; // completed tool calls (ring, last 15)
+const openCalls = [];   // in-flight tool calls
 
 function logSup(msg) {
   process.stderr.write(msg + "\n");
+}
+
+function fillTemplate(tpl, vars) {
+  return tpl.replace(/\{(\w+)\}/g, (m, k) => (vars[k] !== undefined ? String(vars[k]) : m));
+}
+
+function consultAllowed(trigger) {
+  const acts = [];
+  if (trigger === "loop" && steersUsed < maxSteers) acts.push("steer");
+  if (forksUsed < maxForks) acts.push("fork");
+  acts.push("continue");
+  return acts;
+}
+
+// Consult mode: hand the intervention to the parent session. The child is
+// shut down orderly (finally → client.stop()); the session file persists, so
+// the parent resumes via --consult-file. Sets outcome; caller breaks the loop.
+async function doConsult(trigger, extra) {
+  let lastText = "";
+  try {
+    lastText = (await client.getLastAssistantText())?.text ?? "";
+  } catch { /* best effort */ }
+  if (!lastText) lastText = finalTextAcc;
+  const payload = {
+    v: 1,
+    at: new Date().toISOString(),
+    trigger,
+    ...extra,
+    allowedActions: consultAllowed(trigger),
+    task,
+    attempt,
+    steersUsed,
+    forksUsed,
+    loopsSeen,
+    maxSteers,
+    maxForks,
+    startTs,
+    hardTimeoutMs,
+    sessionId: stateSessionId || null,
+    sessionFile: stateSessionFile || null,
+    taskEntryId: checkpointId,
+    openToolCalls: openCalls,
+    recentToolCalls: recentCalls.slice(-15),
+    lastAssistantText: lastText.slice(0, 4000),
+  };
+  const p = join(process.cwd(), "pi-child-consult.json");
+  writeFileSync(p, JSON.stringify(payload, null, 2));
+  consultOutFile = p;
+  consultOut = payload;
+  outcome = `consult-${trigger}`;
+  logSup(
+    `[supervisor] CONSULT (${trigger}): payload → ${p}; allowed actions: ` +
+      `${payload.allowedActions.join("|")}. The child is being shut down orderly; ` +
+      `the session persists — resume with --consult-file to steer.`
+  );
 }
 
 function handleEvent(ev) {
@@ -334,6 +482,7 @@ function handleEvent(ev) {
     toolDepth++;
     lastToolName = ev.toolName;
     logSup(`[child tool: ${ev.toolName}] ${JSON.stringify(ev.args ?? {}).slice(0, 200)}`);
+    openCalls.push({ tool: ev.toolName, args: JSON.stringify(ev.args ?? {}).slice(0, 300) });
     const sig = ev.toolName + "\x1f" + JSON.stringify(ev.args ?? {});
     if (sig === lastSig) loopCount++;
     else {
@@ -345,6 +494,12 @@ function handleEvent(ev) {
     }
   } else if (ev.type === "tool_execution_end") {
     if (toolDepth > 0) toolDepth--;
+    const c = openCalls.pop();
+    if (c) {
+      c.isError = !!ev.isError;
+      recentCalls.push(c);
+      if (recentCalls.length > 15) recentCalls.shift();
+    }
   } else if (ev.type === "extension_ui_request") {
     if (["select", "confirm", "input", "editor"].includes(ev.method)) {
       logSup(
@@ -376,11 +531,12 @@ async function doSteer(pl) {
   pendingLoop = null;
   lastSig = null;
   loopCount = 0;
-  const msg =
-    `You are repeating yourself: the tool call \`${pl.toolName}\` with the same arguments has ` +
-    `now occurred ${pl.count} times in a row without progress. Stop. Reassess the situation, ` +
-    `pick a DIFFERENT concrete next step, and continue with the original task. Do not repeat ` +
-    `that failing call; if the task cannot proceed, say exactly where it is blocked.`;
+  const msg = steerMsg
+    ? fillTemplate(steerMsg, { tool: pl.toolName, count: pl.count })
+    : `You are repeating yourself: the tool call \`${pl.toolName}\` with the same arguments has ` +
+      `now occurred ${pl.count} times in a row without progress. Stop. Reassess the situation, ` +
+      `pick a DIFFERENT concrete next step, and continue with the original task. Do not repeat ` +
+      `that failing call; if the task cannot proceed, say exactly where it is blocked.`;
   logSup(`[supervisor] L1 steer #${steersUsed}/${maxSteers}: loop on ${pl.toolName} x${pl.count}`);
   const disp = await client.steer(msg);
   logSup(`[supervisor] steer disposition=${disp}`);
@@ -426,10 +582,11 @@ async function doFork(reason) {
   logSup(`[supervisor] session now id=${stateSessionId || "?"} file=${stateSessionFile || "?"}`);
   attempt++;
   finalTextAcc = "";
-  const note =
-    `[supervisor] A previous attempt at this task ${reason}. That approach is exhausted — do ` +
-    `NOT repeat it. Break the work into smaller steps, verify assumptions as you go, and if ` +
-    `you cannot proceed, finish with a clear explanation of exactly where it is blocked.`;
+  const note = forkNote
+    ? fillTemplate(forkNote, { reason })
+    : `A previous attempt at this task ${reason}. That approach is exhausted — do NOT repeat it. ` +
+      `Break the work into smaller steps, verify assumptions as you go, and if you cannot proceed, ` +
+      `finish with a clear explanation of exactly where it is blocked.`;
   await client.prompt(task + "\n\n" + note);
   checkpointId = await findCheckpoint();
   lastSig = null;
@@ -472,11 +629,66 @@ try {
 
   startTs = Date.now();
   lastEventAt = startTs;
-  const disp0 = await client.prompt(task);
-  logSup(`[supervisor] prompt disposition=${disp0}`);
-  checkpointId = await findCheckpoint();
-  if (!checkpointId) {
-    logSup("[supervisor] WARN: no checkpoint entry found; L2 forks will retry in place");
+  if (resumePayload) {
+    // Resume from a consult file: budgets, attempt count and the hard wall
+    // clock come from the file, not from flags, so they carry across resumes.
+    attempt = resumePayload.attempt ?? 1;
+    steersUsed = resumePayload.steersUsed ?? 0;
+    forksUsed = resumePayload.forksUsed ?? 0;
+    loopsSeen = resumePayload.loopsSeen ?? 0;
+    maxSteers = resumePayload.maxSteers ?? maxSteers;
+    maxForks = resumePayload.maxForks ?? maxForks;
+    startTs = resumePayload.startTs ?? startTs;
+    hardTimeoutMs = resumePayload.hardTimeoutMs ?? hardTimeoutMs;
+    checkpointId = resumePayload.taskEntryId ?? null;
+    lastEventAt = Date.now();
+    logSup(
+      `[supervisor] RESUME (action=${resumeAction}) attempt=${attempt} ` +
+        `steers=${steersUsed}/${maxSteers} forks=${forksUsed}/${maxForks} session=${stateSessionId || "?"}`
+    );
+    if (resumeAction === "fork") {
+      if (!checkpointId) {
+        console.error("error: consult file has no taskEntryId; cannot fork");
+        process.exit(1);
+      }
+      forksUsed++;
+      attempt++;
+      try {
+        const r = await client.fork(checkpointId);
+        if (r && r.cancelled) logSup("[supervisor] fork cancelled by an extension; continuing in the same session");
+      } catch (e) {
+        logSup(`[supervisor] fork failed (${e.message}); continuing in the same session`);
+      }
+      try {
+        const st = await client.getState();
+        if (st) {
+          stateSessionId = st.sessionId ?? stateSessionId;
+          stateSessionFile = st.sessionFile ?? stateSessionFile;
+        }
+      } catch { /* best effort */ }
+      logSup(`[supervisor] session now id=${stateSessionId || "?"} file=${stateSessionFile || "?"}`);
+      const d = await client.prompt(task + "\n\n" + resumeMessage);
+      logSup(`[supervisor] fork re-prompt disposition=${d}`);
+      checkpointId = await findCheckpoint();
+    } else if (resumeAction === "steer") {
+      steersUsed++;
+      const d = await client.prompt(resumeMessage);
+      logSup(`[supervisor] steer disposition=${d}`);
+    } else {
+      // continue: hand the remaining budget to the built-in ladder
+      const d = await client.prompt(
+        "[supervisor] Supervision was paused and has now resumed. Continue the original task from where you left off."
+      );
+      logSup(`[supervisor] continue disposition=${d}`);
+      consultMode = false;
+    }
+  } else {
+    const disp0 = await client.prompt(task);
+    logSup(`[supervisor] prompt disposition=${disp0}`);
+    checkpointId = await findCheckpoint();
+    if (!checkpointId) {
+      logSup("[supervisor] WARN: no checkpoint entry found; L2 forks will retry in place");
+    }
   }
 
   let settled = false;
@@ -491,6 +703,12 @@ try {
             // External abort — most commonly the host repetition guard
             // refusing the Nth identical call and aborting the turn.
             // Recoverable: fork + retry (new session = fresh guard counter).
+            if (consultMode && forksUsed < maxForks) {
+              await doConsult("external-abort", {
+                detail: "the host aborted the turn (repetition guard or external abort)",
+              });
+              break;
+            }
             if (forksUsed < maxForks) {
               await doFork(
                 "aborted mid-run by the host (repetition guard or external abort)"
@@ -517,6 +735,10 @@ try {
       break;
     }
     if (pendingLoop) {
+      if (consultMode && (steersUsed < maxSteers || forksUsed < maxForks)) {
+        await doConsult("loop", { loop: { tool: pendingLoop.toolName, count: pendingLoop.count } });
+        break;
+      }
       if (steersUsed < maxSteers) {
         await doSteer(pendingLoop);
         continue;
@@ -534,6 +756,10 @@ try {
       const what = inTool
         ? `no events for ${Math.round(idleLimit / 1000)}s during tool call \`${lastToolName}\``
         : `no events for ${Math.round(idleLimit / 1000)}s (model stalled or hung)`;
+      if (consultMode && forksUsed < maxForks) {
+        await doConsult("stall", { detail: what, inTool, lastTool: lastToolName, idleMs: now - lastEventAt });
+        break;
+      }
       if (forksUsed < maxForks) {
         await doFork(`stalled (${what})`);
         continue;
@@ -549,8 +775,9 @@ try {
   } catch { /* best effort */ }
   if (!finalText) finalText = finalTextAcc.trim();
 
+  const isConsult = outcome.startsWith("consult-");
   const result = {
-    status: outcome === "completed" ? "completed" : "stuck",
+    status: outcome === "completed" ? "completed" : isConsult ? "consult" : "stuck",
     exitReason: outcome,
     task,
     attempts: attempt,
@@ -559,9 +786,15 @@ try {
     sessionFile: stateSessionFile || null,
     finalText: finalText.slice(0, 4000),
     elapsedMs: Date.now() - startTs,
+    recentToolCalls: recentCalls.slice(-15),
   };
+  if (isConsult && consultOut) {
+    result.consultFile = consultOutFile;
+    result.trigger = consultOut.trigger;
+    result.allowedActions = consultOut.allowedActions;
+  }
   process.stdout.write(`\n=== RESULT === ${JSON.stringify(result)}\n`);
-  exitCode = outcome === "completed" ? 0 : 3;
+  exitCode = outcome === "completed" ? 0 : isConsult ? 4 : 3;
 } catch (err) {
   logSup(`\n[error] ${err.message}`);
   exitCode = 1;
