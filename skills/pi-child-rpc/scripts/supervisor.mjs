@@ -34,6 +34,18 @@
 //   continue = resume with the built-in ladder for the rest of the run
 //   Budgets, attempt count and the hard wall clock carry across resumes.
 //
+//   Consult-mode sensors (autonomous mode keeps exactly the original three
+//   triggers — loop / stall / external-abort — unchanged):
+//     - "error-loop"  --max-errors <n>  (default 6, 0=off): N consecutive
+//       FAILING tool calls (any tools/args) — the child is thrashing, even
+//       though the calls are not byte-identical
+//     - "heartbeat"   --heartbeat <n>   (default 0=off): after every N
+//       completed tool calls — periodic parent review of progress. The payload
+//       carries the recent tool trace (args + results + errors + last text)
+//       so the parent can judge drift or any problem a fixed detector cannot
+//       name. Each heartbeat = one parent turn + child restart (the child
+//       re-reads its transcript), so keep N large.
+//
 // Usage:
 //   node supervisor.mjs "task description" [options]
 //
@@ -83,6 +95,10 @@ Options:
   --consult             Consult mode: on an intervention, persist the session,
                         write pi-child-consult.json and exit 4 so the parent
                         session can steer (requires a persisted session)
+  --max-errors <n>      Consult sensor: N consecutive failing tool calls
+                        triggers a consult (default 6; 0 disables)
+  --heartbeat <n>       Consult sensor: consult after every N completed tool
+                        calls for a parent progress review (default 0=off)
   --idle-timeout <sec>  No-events timeout while the model is thinking (default 300)
   --tool-timeout <sec>  No-events timeout while one tool call is running
                         (long builds are normal; default 1800)
@@ -117,6 +133,8 @@ let consult = false;
 let consultFileArg = "";
 let resumeAction = "";
 let resumeMessage = "";
+let maxErrors = 6;
+let heartbeatN = 0;
 let idleTimeoutMs = 300 * 1000;
 let toolTimeoutMs = 1800 * 1000;
 let hardTimeoutMs = 240 * 60 * 1000;
@@ -142,6 +160,8 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--consult-file") consultFileArg = argv[++i];
   else if (a === "--action") resumeAction = argv[++i];
   else if (a === "--message") resumeMessage = argv[++i];
+  else if (a === "--max-errors") maxErrors = Number(argv[++i]);
+  else if (a === "--heartbeat") heartbeatN = Number(argv[++i]);
   else if (a === "--idle-timeout") idleTimeoutMs = Number(argv[++i]) * 1000;
   else if (a === "--tool-timeout") toolTimeoutMs = Number(argv[++i]) * 1000;
   else if (a === "--timeout") hardTimeoutMs = Number(argv[++i]) * 60 * 1000;
@@ -225,6 +245,8 @@ for (const [flag, value] of [
   ["--loop-threshold", loopThreshold],
   ["--max-steers", maxSteers],
   ["--max-forks", maxForks],
+  ["--max-errors", maxErrors],
+  ["--heartbeat", heartbeatN],
   ["--idle-timeout", idleTimeoutMs],
   ["--tool-timeout", toolTimeoutMs],
   ["--timeout", hardTimeoutMs],
@@ -414,6 +436,8 @@ let consultOutFile = "";
 let consultOut = null; // last consult payload (surfaced in RESULT)
 const recentCalls = []; // completed tool calls (ring, last 15)
 const openCalls = [];   // in-flight tool calls
+let errorStreak = 0;           // consecutive failing tool calls
+let toolsSinceCheckpoint = 0;  // completed tool calls since start/resume
 
 function logSup(msg) {
   process.stderr.write(msg + "\n");
@@ -425,7 +449,9 @@ function fillTemplate(tpl, vars) {
 
 function consultAllowed(trigger) {
   const acts = [];
-  if (trigger === "loop" && steersUsed < maxSteers) acts.push("steer");
+  // steer is available whenever the child is healthy (loop/error-loop/heartbeat);
+  // not for stall/external-abort, where a steer cannot reach a hung turn.
+  if ((trigger === "loop" || trigger === "error-loop" || trigger === "heartbeat") && steersUsed < maxSteers) acts.push("steer");
   if (forksUsed < maxForks) acts.push("fork");
   acts.push("continue");
   return acts;
@@ -458,6 +484,8 @@ async function doConsult(trigger, extra) {
     sessionId: stateSessionId || null,
     sessionFile: stateSessionFile || null,
     taskEntryId: checkpointId,
+    errorStreak,
+    toolsSinceCheckpoint,
     openToolCalls: openCalls,
     recentToolCalls: recentCalls.slice(-15),
     lastAssistantText: lastText.slice(0, 4000),
@@ -497,6 +525,11 @@ function handleEvent(ev) {
     const c = openCalls.pop();
     if (c) {
       c.isError = !!ev.isError;
+      if (ev.durationMs !== undefined) c.durationMs = ev.durationMs;
+      const rawRes = typeof ev.result === "string" ? ev.result : JSON.stringify(ev.result ?? "");
+      c.result = rawRes.slice(0, 300);
+      errorStreak = c.isError ? errorStreak + 1 : 0;
+      toolsSinceCheckpoint++;
       recentCalls.push(c);
       if (recentCalls.length > 15) recentCalls.shift();
     }
@@ -749,6 +782,20 @@ try {
       }
       outcome = "stuck-loop";
       break;
+    }
+    // Consult-mode sensors: error-loop and heartbeat. Autonomous mode keeps
+    // exactly the original three triggers (loop / stall / external-abort).
+    if (consultMode && !pendingLoop) {
+      let sensor = null;
+      if (maxErrors > 0 && errorStreak >= maxErrors) {
+        sensor = { kind: "error-loop", extra: { detail: `${errorStreak} consecutive tool calls failed`, errors: errorStreak } };
+      } else if (heartbeatN > 0 && toolsSinceCheckpoint >= heartbeatN) {
+        sensor = { kind: "heartbeat", extra: { detail: `${toolsSinceCheckpoint} tool calls since the last checkpoint` } };
+      }
+      if (sensor && (sensor.kind === "heartbeat" || steersUsed < maxSteers || forksUsed < maxForks)) {
+        await doConsult(sensor.kind, sensor.extra);
+        break;
+      }
     }
     const inTool = toolDepth > 0;
     const idleLimit = inTool ? toolTimeoutMs : idleTimeoutMs;
