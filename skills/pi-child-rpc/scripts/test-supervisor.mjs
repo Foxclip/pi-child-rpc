@@ -295,5 +295,22 @@ run({
   expect: ["missing expected file", "report.md", "\"status\":\"completed\""],
 });
 
+// 10. Autonomous text-loop (long text without tool calls) → L1 steer → back on task
+//     (the "thinking loop" — invisible to every other sensor)
+run({
+  name: "autonomous text-loop → L1 steer → completed",
+  args: [
+    "task with enough length to pass the short-task warning threshold for tests",
+    "--max-text", "200",
+    "--max-steers", "2", "--max-forks", "2",
+  ],
+  phases: [
+    [say("A".repeat(300))], // no settle: the sensor fires mid-stream
+    [...tool("bash", { cmd: "ls" }), ...done("Back on task. Finished.")],
+  ],
+  expect: ["L1 text-loop steer", "thinking loop", "\"status\":\"completed\""],
+  expectNot: ["L2 fork"],
+});
+
 console.log(`\n=== ${passCount} passed, ${failCount} failed ===`);
 process.exit(failCount === 0 ? 0 : 1);
