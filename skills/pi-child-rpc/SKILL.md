@@ -1,6 +1,6 @@
 ---
 name: pi-child-rpc
-description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use when a task needs a long-lived, isolated second pi — parallel work, a sub-conversation, or orchestrated follow-ups — that one-shot `pi --print` cannot cover. Includes supervisor.mjs for unattended long runs: loop/stall/degenerate-settle detection, steer→fork→stuck ladder, --expect-file completion artifacts, always-on progress log.
+description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use when a task needs a long-lived, isolated second pi — parallel work, a sub-conversation, or orchestrated follow-ups — that one-shot `pi --print` cannot cover. Also bundles supervisor.mjs for unattended long runs (loop/stall/degenerate-settle detection, steer/fork/stuck ladder, --expect-file completion artifacts, always-on progress log).
 ---
 
 # Interacting with a child pi process
