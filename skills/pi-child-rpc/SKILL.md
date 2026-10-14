@@ -1,6 +1,6 @@
 ---
 name: pi-child-rpc
-description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use when a task needs a long-lived, isolated second pi — parallel work, a sub-conversation, or orchestrated follow-ups — that one-shot `pi --print` cannot cover. Also bundles supervisor.mjs for unattended long runs (loop/stall/degenerate-settle detection, steer/fork/stuck ladder, --expect-file completion artifacts, always-on progress log).
+description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use when a task needs a long-lived, isolated second pi — parallel work, a sub-conversation, or orchestrated follow-ups — that one-shot `pi --print` cannot cover. Also bundles supervisor.mjs for unattended long runs (loop/stall/degenerate-settle detection, steer/fork/stuck ladder, --expect-file completion artifacts, always-on progress log) and a Docker 3-layer setup (scripts/docker/hypervisor.mjs) that runs supervisor and child in a container with the model on the host.
 ---
 
 # Interacting with a child pi process
@@ -13,6 +13,7 @@ A pi agent can spawn and converse with another pi agent. It is not limited to `a
 | One-shot, structured events | JSON mode | `pi --mode json "task"` |
 | Multi-turn, bidirectional | **RPC mode** | `scripts/rpc-child.mjs` in this skill, or a custom `RpcClient` script |
 | One long autonomous job, unattended | **Supervised RPC** | `scripts/supervisor.mjs` (loop/stall detection + steer→fork→stuck ladder) |
+| One long autonomous job, sandboxed in a container | **Docker 3-layer** | `scripts/docker/hypervisor.mjs` (host) → supervisor + child in the container |
 | In-process Node/Bun, full API | SDK | `createAgentSession()` from `@earendil-works/pi-coding-agent` |
 
 If the child's job is fire-and-forget with no ongoing dialogue, `acp_delegate` is usually better: clean context, async, result saved to a file.
@@ -139,6 +140,126 @@ A long autonomous task is a *contract*, not a suggestion. Every failure in this 
 - **The session file rotates after an L2 fork.** Anything keyed to one session-file path goes blind after a fork. Follow `sessionId`/`sessionFile` in the RESULT (or the consult file), or just watch the progress log — it is cwd-relative and stable.
 - **Windows gotchas** (this skill was developed under them): the console codepage is cp1251 — any script that prints Cyrillic must set `PYTHONIOENCODING=utf-8` and reconfigure stdout with `errors="replace"`, or it crashes on the first non-Latin character. MSYS bash expands `$_`/`$()` inside double-quoted `powershell -Command "..."` — write a `.ps1`/`.py` file and run it with `-File`/`python <file>` instead. Host safety rules may block inline one-liners for the same reason.
 - **After a hard-timeout or stuck exit**, capture "what remains" from the child's STATUS.md *before* relaunching: the resume (same session file, fresh supervisor run) then starts with a precise remainder list instead of re-deriving state.
+
+## Docker 3-layer run (hypervisor.mjs)
+
+To run a long autonomous job **inside a container** — sandboxed filesystem, throwaway state, model served from the host — use the 3-layer setup:
+
+```
+host:      hypervisor.mjs   config generation, model forwarder, health checks,
+                            image build, container lifecycle, no-progress
+                            backstop, RESULT collection
+container: supervisor.mjs (unchanged) → child pi --mode rpc → model
+```
+
+This is the Docker **variant** of the skill. The host variant (supervisor +
+child both on the host, no Docker) is `supervisor.mjs` directly — the two are
+alternatives, and all supervisor options work identically in both.
+
+Why 3 layers: the in-container supervisor owns the tight agent-behavior loop
+(loop/steer/fork — forks stay cheap because they are local process spawns with
+local session files). The container boundary creates a failure domain it cannot
+see: the host model server / forwarder can die, and the container itself can
+wedge. Only a host-side layer can see and heal those. Each layer recovers what
+it can see cheaply and escalates the rest.
+
+### Usage
+
+```bash
+node <skill_dir>/scripts/docker/hypervisor.mjs "long autonomous task" [options]
+```
+
+Run it from the directory the child should work in (that is `--workdir`,
+mounted at `/work`). The hypervisor then: generates the container's agent
+config under `<workdir>/.pi-docker/agent/` (models.json + auth.json; session
+files created later land there too), builds the image `pi-child-rpc:docker`
+if missing (bundled `scripts/docker/Dockerfile`: node + global pi install;
+skill scripts are bind-mounted at `/opt/pi-child-rpc` so skill updates never
+require an image rebuild), starts the host model forwarder, health-checks the
+model endpoint, launches the container, and watches it.
+
+**The reserved-id gotcha (cost of hours to find, so it is enforced):** in pi
+v1.2.0 the provider id `llama.cpp` is RESERVED — a built-in router integration
+whose model list comes from the router's *currently loaded* models. A
+models.json entry under that id collides with it: `pi --list-models` shows
+"No models available" **even though auth reports ready** (the key is read
+fine). The hypervisor therefore registers the endpoint under a **non-reserved
+id** (default `localllama`, or `$PI_PROVIDER` when it is non-reserved), and
+**refuses `--provider llama.cpp`** (exit 2). A reserved `$PI_PROVIDER`
+(`llama.cpp`) is silently swapped to `localllama` with a stderr note.
+
+### Flags
+
+All supervisor options pass through unchanged: `--task --session-id --session
+--no-session --session-dir --name --provider --model --loop-threshold
+--max-steers --max-forks --steer-msg --fork-note --consult --consult-file
+--action --message --max-errors --heartbeat --max-text --idle-timeout
+--tool-timeout --timeout --progress-log --expect-file --preamble
+--keep-question-tool --keep-delegate-tool`. (A task may be positional or via
+`--task`; a task beginning with `--` goes after a bare `--`.)
+
+Hypervisor-only:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--image <name>` | `pi-child-rpc:docker` | container image; built from the bundled Dockerfile if missing |
+| `--docker <cmd>` | `docker` | container runtime command |
+| `--workdir <dir>` | cwd | host dir mounted at `/work`; child works there |
+| `--model-base-url <u>` | `http://host.docker.internal:8081/v1` | model URL **from the container** |
+| `--provider <p>` | `$PI_PROVIDER` or `localllama` | non-reserved provider id (see gotcha above) |
+| `--model <m>` | `$PI_MODEL` | model id |
+| `--api-key <key>` | provider id | key written for the endpoint (local servers ignore it) |
+| `--context-window <n>` | `262144` | declared context window and max output |
+| `--forward-from <port>` | `8081` | host port of the model forwarder |
+| `--forward-to <h:p>` | `127.0.0.1:8080` | host target the forwarder pipes to |
+| `--no-forward` | off | skip the forwarder (model already reachable from the container) |
+| `--skip-health` | off | skip model health checks (e.g. model lives in the container) |
+| `--restarts <n>` | `1` | container restarts on infrastructure failure |
+| `--no-progress <sec>` | `2700` | kill+restart after this much total silence in the progress log; `0` disables. Must exceed the supervisor's `--tool-timeout` — a single long tool call is legitimate silence |
+| `--keep-container` | off | do not `--rm` the container on exit |
+| `--watch` | off | open a **host** window tailing the progress log (the in-container supervisor cannot open a host window, so the hypervisor does it) |
+| `--log <path>` | `pi-child-hypervisor.log` in workdir | hypervisor log |
+
+### Monitoring (host side)
+
+Two logs, both on the host in the workdir:
+
+- `pi-child-hypervisor.log` — lifecycle: config written, image/forwarder state,
+  health, the exact `docker run` command, model-down warnings, restarts,
+  final status.
+- `pi-child-progress.log` — child activity (written by the in-container
+  supervisor: `[start]`, one line per tool call, `[settled]`, `[result]`).
+
+Poll the progress log for liveness (same non-identical-polls rule as host
+runs). The hypervisor re-checks the model server every 30 s; a model outage is
+logged as `WARNING model server unreachable ... — the child will stall`, and
+once the `--no-progress` window elapses with no progress the container is
+killed and — if the model is reachable again and restart budget remains — a
+fresh container is launched (fresh auto session id).
+
+### Exit codes and restarts
+
+The hypervisor propagates the supervisor's exit codes (0 completed, 3 stuck,
+4 consult) and exits 1 on infrastructure failure / 2 on usage. **Task-level
+outcomes (0/3/4) never restart**; error (1) and no-progress kills restart a
+fresh container only when the model server is reachable at that moment (up to
+`--restarts`). The final line is `=== HYPERVISOR RESULT === {json}` with
+`status`, `exitCode`, `attempts`, `elapsedMs`, `workdir`, `progressLog`,
+`sessionFile` (container path) + `sessionFileHost` (host path), and the full
+supervisor `result` nested.
+
+Consult resume works unchanged: the consult file lands at
+`<workdir>/pi-child-consult.json`, and re-running the hypervisor with
+`--consult-file pi-child-consult.json --action steer|fork|continue --message
+"..."` resumes in a new container (budgets carry over as usual; session files
+live under `<workdir>/.pi-docker/agent/sessions/`).
+
+### Windows notes
+
+The hypervisor is a plain node script (no shell involved), so MSYS
+path-mangling does not apply. Bind mounts are used for the workdir and the
+skill scripts dir (read-only at `/opt/pi-child-rpc`). `--watch` opens a host
+window via `wt`/PowerShell, as in the rest of the skill.
 
 ## Custom client (when the harness isn't enough)
 

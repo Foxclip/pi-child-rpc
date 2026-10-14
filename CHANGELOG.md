@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.5.0 — 2026-10-15
+
+New variant: the 3-layer Docker run. The skill now has two variants — host
+(supervisor + child both on the host, `supervisor.mjs` directly, unchanged) and
+Docker (host hypervisor → container supervisor → container child, model on the
+host). The supervisor is unchanged in both; all of its options pass through
+the new hypervisor unchanged.
+
+### scripts/docker/hypervisor.mjs (new)
+- Host-side hypervisor for running `supervisor.mjs` + child inside a container
+  while the model is served from the host. Owns what only the host can see:
+  - generates the container's agent config (models.json + auth.json) under
+    `<workdir>/.pi-docker/agent/` — sessions land there too, untouched on
+    regeneration;
+  - embedded model forwarder `0.0.0.0:8081 → 127.0.0.1:8080` by default
+    (reused if the port already serves a model endpoint; `--no-forward` to skip);
+  - model health checks before launch and every 30 s during the run (the
+    in-container supervisor cannot see the host model server);
+  - builds the image if missing, launches the container, watches the progress
+    log for total no-progress (`--no-progress`, default 2700 s), kills +
+    restarts a fresh container on infrastructure failure only when the model
+    is reachable (task-level exits 0/3/4 never restart);
+  - collects the supervisor's RESULT and prints `=== HYPERVISOR RESULT ===`
+    with host-side path mapping (`sessionFileHost`).
+- **Reserved provider-id guard**: pi v1.2.0 reserves the provider id
+  `llama.cpp` (built-in router integration) — a models.json entry under that id
+  collides and the model list stays empty even though auth reports ready. The
+  hypervisor registers under a non-reserved id (default `localllama`, or
+  `$PI_PROVIDER` when non-reserved), swaps a reserved `$PI_PROVIDER` with a
+  note, and refuses `--provider llama.cpp` (exit 2).
+- Strict CLI like the rest of the skill; exit codes: the supervisor's (0/3/4)
+  or 1 infrastructure / 2 usage. `--watch` opens the host-side progress window
+  (the in-container supervisor cannot). Flag surface: `--image --docker
+  --workdir --model-base-url --provider --model --api-key --context-window
+  --forward-from --forward-to --no-forward --skip-health --restarts
+  --no-progress --keep-container --watch --log` + all supervisor options
+  passthrough.
+
+### scripts/docker/Dockerfile (new)
+`node:24-bookworm-slim` + global `@earendil-works/pi-coding-agent` install.
+Skill scripts are bind-mounted read-only at `/opt/pi-child-rpc` at run time,
+so skill updates never require an image rebuild. Image name:
+`pi-child-rpc:docker`.
+
+### SKILL.md
+- New **Docker 3-layer run** section: architecture (why the supervisor stays
+  in the container and the hypervisor is on the host), usage, the
+  reserved-id gotcha, full flag table, host-side monitoring, exit codes and
+  restart policy, Windows notes. Interface table gained a Docker row.
+
 ## v0.4.0 — 2026-10-15
 
 Hardening after a week of long unattended runs on a local 27B model (two of which
