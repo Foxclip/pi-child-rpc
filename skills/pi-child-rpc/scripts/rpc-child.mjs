@@ -20,6 +20,8 @@
 //   - Prints [reply-N] blocks and a final machine-readable line:
 //       === RESULT === {"replies":["...", "..."]}
 //   - Exits non-zero on timeout or child failure.
+//   - Strict CLI: unknown --flags are an error (exit 2) — they used to be
+//     silently swallowed into the prompt text. A bare -- ends flag parsing.
 //   - Sessions: --no-session (throwaway) by default. --session-id <id> persists
 //     the session under a stable ID (created if missing); later runs with the
 //     same ID and working directory resume the conversation. --session
@@ -86,6 +88,14 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "-h" || a === "--help") {
     console.log(USAGE);
     process.exit(0);
+  } else if (a === "--") {
+    positional.push(...argv.slice(i + 1));
+    break;
+  } else if (a.startsWith("--")) {
+    console.error(`error: unknown flag "${a}" — unknown flags used to be silently treated as prompt text`);
+    console.error(`valid flags: --turn --provider --model --timeout --watch --keep-question-tool --session-id --session --session-dir --name -h --help`);
+    console.error(`if your prompt starts with --, put a bare -- before it`);
+    process.exit(2);
   } else positional.push(a);
 }
 
