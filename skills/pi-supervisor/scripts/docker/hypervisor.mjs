@@ -58,7 +58,6 @@
 //                          supervisor's --tool-timeout (a single long tool call is
 //                          legitimate silence).
 //   --keep-container       Do not --rm the container on exit (inspect it)
-//   --watch                Open a host window tailing pi-child-progress.log
 //   --log <path>           Hypervisor log (default pi-child-hypervisor.log in workdir)
 //   -h, --help             Show this help
 //
@@ -71,11 +70,10 @@
 // even though auth reports ready). Register the endpoint under a non-reserved
 // id (default "localllama"); this script refuses --provider llama.cpp.
 
-import { spawn, spawnSync, execFileSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -103,7 +101,6 @@ Hypervisor options:
   --restarts <n>         Container restarts on infra failure (default 1)
   --no-progress <sec>    Silence window before kill+restart (default 2700, 0=off)
   --keep-container       Keep the container after exit
-  --watch                Host window tailing the progress log
   --log <path>           Hypervisor log (default pi-child-hypervisor.log in workdir)
   -h, --help             Show this help`;
 
@@ -124,7 +121,7 @@ const HY_VALUE = new Set([
   "--no-progress", "--log",
 ]);
 const HY_BOOL = new Set([
-  "--no-forward", "--skip-health", "--keep-container", "--watch", "-h", "--help",
+  "--no-forward", "--skip-health", "--keep-container", "-h", "--help",
 ]);
 // Shared: hypervisor uses them for config/env AND passes them to the supervisor.
 const SHARED_VALUE = new Set(["--provider", "--model"]);
@@ -148,7 +145,6 @@ const opt = {
   restarts: 1,
   noProgressSec: 2700,
   keepContainer: false,
-  watch: false,
   log: "",
 };
 let sawHelp = false;
@@ -204,7 +200,6 @@ for (let i = 0; i < argv.length; i++) {
       case "--no-forward": opt.noForward = true; break;
       case "--skip-health": opt.skipHealth = true; break;
       case "--keep-container": opt.keepContainer = true; break;
-      case "--watch": opt.watch = true; break;
     }
     continue;
   }
@@ -526,38 +521,6 @@ function hostSessionFile(c) {
 }
 
 // ---------------------------------------------------------------------------
-// --watch (host window tailing the progress log; the in-container supervisor
-// cannot open a host window, so the hypervisor does it on the host side)
-// ---------------------------------------------------------------------------
-function openWatchWindow() {
-  const tailCmd = `Get-Content '${winPath(progressLogHost)}' -Wait -Encoding utf8`;
-  let opened = null;
-  try {
-    const wtPath = execFileSync("where.exe", ["wt"], {
-      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
-    }).trim().split(/\r?\n/)[0];
-    if (wtPath) {
-      spawn(wtPath, ["new-tab", "powershell", "-NoExit", "-Command", tailCmd], {
-        windowsHide: true, detached: true, stdio: "ignore",
-      }).unref();
-      opened = "Windows Terminal (wt new-tab)";
-    }
-  } catch { /* no wt — fall through */ }
-  if (!opened) {
-    try {
-      const ps1 = join(tmpdir(), `pi-child-hyp-watch-${process.pid}.ps1`);
-      writeFileSync(ps1, `Start-Process powershell -ArgumentList @('-NoExit','-Command','${tailCmd.replace(/'/g, "''")}')\r\n`);
-      spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ps1], {
-        windowsHide: true, detached: true, stdio: "ignore",
-      }).unref();
-      opened = "PowerShell Start-Process";
-    } catch { /* no powershell */ }
-  }
-  if (opened) log(`watch window opened via ${opened} (tailing ${winPath(progressLogHost)})`);
-  else log("watch: could not open a window — tail the log manually");
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 async function main() {
@@ -570,7 +533,6 @@ async function main() {
   writeAgentConfig();
   ensureImage();
   await startForwarder();
-  if (opt.watch) openWatchWindow();
 
   if (!opt.skipHealth) {
     const h = await modelHealth();

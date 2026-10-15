@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.8.0 — 2026-10-15
+
+**Removed: the `--watch` live activity window (all variants).** The
+`pi-child-live.log` mirror and the `wt`/PowerShell window-opening were removed
+from `rpc-child.mjs`, `supervisor.mjs` and the Docker `hypervisor.mjs` —
+`--watch` is now an unknown flag (strict CLI → exit 2). Visibility stays with
+the always-on compact progress log (`pi-child-progress.log`, one line per
+completed tool call) — poll that file instead of opening a window.
+
 ## v0.7.0 — 2026-10-15
 
 **Low-integrity sandbox variant (`scripts/integrity/`) — native Windows,

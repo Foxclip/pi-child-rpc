@@ -118,7 +118,7 @@ node <skill_dir>/scripts/supervisor.mjs "Refactor module X to use Y; verify with
 
 - **Persists the session by default** (auto `--session-id sup-<timestamp>`, `--name` = the ID) so runs stay resumable. Every L2 fork creates a NEW session file — the RESULT line reports the **final** session (`sessionId`/`sessionFile`); resume THAT file with `rpc-child.mjs --session <file>` to continue or debug. `--no-session` for throwaway.
 - RESULT JSON: `{status: "completed"|"stuck"|"consult", exitReason: completed|hard-timeout|stuck-loop|stuck-idle|aborted-external|degenerate-settle|missing-expected-file|consult-loop|consult-stall|consult-external-abort|consult-error-loop|consult-heartbeat|consult-text-loop, task (≤200 chars) + taskChars, attempts, interventions: {steers, forks, loopsSeen}, sessionId, sessionFile, finalText (≤4000 chars) + finalTextTruncated, settle: {attemptTextChars, attemptToolCalls, lastMessageTextChars, errorStreakAtEnd}, expectedFiles (when given), progressLog, elapsedMs, recentToolCalls (last 15: {tool, args, isError, result≤300, durationMs}), consultFile/trigger/allowedActions (status=consult only)}`. The same summary is also written as a `[result]` line in the progress log. Exit codes: 0 completed, 3 stuck, **4 consult** (waiting on the parent's resume), 1 error, 2 usage (including an unknown `--flag`).
-- Tuning: `--loop-threshold` (default **4** — one below the guard's default abort=5 so the steer lands first), `--max-steers`, `--max-forks`, `--idle-timeout`, `--tool-timeout`, `--timeout <min>` (hard wall clock, default 240), `--expect-file <path>` (repeatable), `--watch`, `--keep-delegate-tool`, consult sensors (`--max-errors`, `--heartbeat`, `--max-text`), steering (`--consult`, `--consult-file`, `--action`, `--message`, `--steer-msg`, `--fork-note`), plus all harness session/model flags (`--provider`, `--model`, `--session-id`, `--session`, `--session-dir`, `--name`).
+- Tuning: `--loop-threshold` (default **4** — one below the guard's default abort=5 so the steer lands first), `--max-steers`, `--max-forks`, `--idle-timeout`, `--tool-timeout`, `--timeout <min>` (hard wall clock, default 240), `--expect-file <path>` (repeatable), `--keep-delegate-tool`, consult sensors (`--max-errors`, `--heartbeat`, `--max-text`), steering (`--consult`, `--consult-file`, `--action`, `--message`, `--steer-msg`, `--fork-note`), plus all harness session/model flags (`--provider`, `--model`, `--session-id`, `--session`, `--session-dir`, `--name`).
 - If you run with a custom `repetitionGuard` config, set `--loop-threshold` one below its `abort` value so L1 always wins the race.
 
 ### Task authoring (what a good long task contains)
@@ -218,7 +218,6 @@ Hypervisor-only:
 | `--restarts <n>` | `1` | container restarts on infrastructure failure |
 | `--no-progress <sec>` | `2700` | kill+restart after this much total silence in the progress log; `0` disables. Must exceed the supervisor's `--tool-timeout` — a single long tool call is legitimate silence |
 | `--keep-container` | off | do not `--rm` the container on exit |
-| `--watch` | off | open a **host** window tailing the progress log (the in-container supervisor cannot open a host window, so the hypervisor does it) |
 | `--log <path>` | `pi-child-hypervisor.log` in workdir | hypervisor log |
 
 ### Monitoring (host side)
@@ -259,8 +258,7 @@ live under `<workdir>/.pi-docker/agent/sessions/`).
 
 The hypervisor is a plain node script (no shell involved), so MSYS
 path-mangling does not apply. Bind mounts are used for the workdir and the
-skill scripts dir (read-only at `/opt/pi-supervisor`). `--watch` opens a host
-window via `wt`/PowerShell, as in the rest of the skill.
+skill scripts dir (read-only at `/opt/pi-supervisor`).
 
 ## Low-integrity sandbox (integrity variant — no admin, no Docker)
 
@@ -409,18 +407,6 @@ p.stdin.close(); p.wait()
 ```
 
 Note: do not use a generic line reader that splits on Unicode line separators (U+2028/U+2029) — split on LF only.
-
-## Watching the child (live window)
-
-The RPC child has **no TUI** — in RPC mode its stdout is the JSON protocol, by design. To watch it work, run the harness with `--watch`:
-
-```bash
-node <skill_dir>/scripts/rpc-child.mjs --watch --turn "..."
-```
-
-It opens a visible window tailing `pi-child-live.log` in the cwd, mirroring the child's events as they happen: message boundaries with roles, streamed text, `tool_execution_start` (name + args) and `tool_execution_end` (result, truncated; errors flagged), turn and settle markers. Window mechanism, in order: (1) **Windows Terminal** — `wt new-tab powershell -NoExit -Command "Get-Content <log> -Wait"` (wt is a GUI app, so this works from any context, including console-less agent sessions); (2) fallback **PowerShell `Start-Process`** (via a temp .ps1 for deterministic quoting) opening a new console window. The tailer uses `-NoExit`, so the transcript stays readable after the run; the log file is kept too. The RPC control flow is unaffected — the parent still drives every turn; `--watch` only adds a mirror.
-
-**Do not use `cmd /c start` for this**: in a console-less context (`not a tty`, e.g. agent tool sessions) it silently fails to create a visible window, and its first unquoted token is treated as the *program*, not the title (`start "title" prog` needs the title quoted). (Plain alternative: launch a TUI-mode `pi` in a new window to watch/steer manually, but then the parent cannot drive it.)
 
 ## Notes
 

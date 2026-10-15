@@ -92,9 +92,8 @@
 //   - Exit codes: 0 completed, 3 stuck, 4 consult (waiting on the parent
 //     session to resume), 1 error, 2 usage.
 
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -133,8 +132,6 @@ Options:
   --tool-timeout <sec>  No-events timeout while one tool call is running
                         (long builds are normal; default 1800)
   --timeout <min>       Hard wall clock for the whole job (default: 240)
-  --watch               Open a terminal window mirroring the child's live
-                        activity (writes pi-child-live.log in the cwd)
   --progress-log <p>    Path of the compact progress log — ALWAYS written,
                         one line per completed tool call (default
                         pi-child-progress.log in the cwd). Poll this file,
@@ -183,7 +180,6 @@ let idleTimeoutMs = 300 * 1000;
 let toolTimeoutMs = 1800 * 1000;
 let hardTimeoutMs = 240 * 60 * 1000;
 let keepQuestionTool = false;
-let watch = false;
 let keepDelegateTool = false;
 let progressLogArg = "";
 const expectFiles = [];
@@ -194,7 +190,7 @@ const VALID_FLAGS = [
   "--name", "--provider", "--model", "--loop-threshold", "--max-steers",
   "--max-forks", "--steer-msg", "--fork-note", "--consult", "--consult-file",
   "--action", "--message", "--max-errors", "--heartbeat", "--max-text",
-  "--idle-timeout", "--tool-timeout", "--timeout", "--watch", "--progress-log",
+  "--idle-timeout", "--tool-timeout", "--timeout", "--progress-log",
   "--expect-file", "--preamble", "--keep-question-tool", "--keep-delegate-tool",
   "-h", "--help",
 ];
@@ -224,7 +220,6 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--idle-timeout") idleTimeoutMs = Number(argv[++i]) * 1000;
   else if (a === "--tool-timeout") toolTimeoutMs = Number(argv[++i]) * 1000;
   else if (a === "--timeout") hardTimeoutMs = Number(argv[++i]) * 60 * 1000;
-  else if (a === "--watch") watch = true;
   else if (a === "--progress-log") progressLogArg = argv[++i];
   else if (a === "--expect-file") expectFiles.push(argv[++i]);
   else if (a === "--preamble") preamble = argv[++i];
@@ -439,64 +434,6 @@ function nextEvent(timeoutMs) {
   });
 }
 
-// --watch: mirror the child's activity to a live log file and open a terminal
-// window tailing it (same mechanism as rpc-child.mjs).
-if (watch) {
-  const watchLog = join(process.cwd(), "pi-child-live.log");
-  writeFileSync(watchLog, ""); // fresh file each run
-  const wlog = (s) => {
-    try { appendFileSync(watchLog, s); } catch { /* window/log best-effort */ }
-  };
-  client.onEvent((event) => {
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-      wlog(event.assistantMessageEvent.delta);
-    } else if (event.type === "message_start") wlog(`\n[message: ${event.message?.role ?? "?"}]\n`);
-    else if (event.type === "message_end") wlog("\n");
-    else if (event.type === "turn_start") wlog("\n=== turn start ===\n");
-    else if (event.type === "turn_end") wlog("\n=== turn end ===\n");
-    else if (event.type === "tool_execution_start")
-      wlog(`\n[tool] ${event.toolName} ${JSON.stringify(event.args ?? {}).slice(0, 300)}\n`);
-    else if (event.type === "tool_execution_end") {
-      const raw = typeof event.result === "string" ? event.result : JSON.stringify(event.result ?? "");
-      const dur = event.durationMs !== undefined ? ` (${event.durationMs}ms)` : "";
-      wlog(`[tool${event.isError ? " ERROR" : " done"}] ${event.toolName}${dur} :: ${raw.slice(0, 500).replace(/\n/g, " ⏎ ")}\n`);
-    } else if (event.type === "agent_settled") wlog("[settled]\n");
-  });
-  const tailCmd = `Get-Content '${watchLog}' -Wait -Encoding utf8`;
-  let opened = null;
-  try {
-    const wtPath = execFileSync("where.exe", ["wt"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim().split(/\r?\n/)[0];
-    if (wtPath) {
-      spawn(wtPath, ["new-tab", "powershell", "-NoExit", "-Command", tailCmd], {
-        windowsHide: true,
-        detached: true,
-        stdio: "ignore",
-      }).unref();
-      opened = "Windows Terminal (wt new-tab)";
-    }
-  } catch { /* no wt — fall through */ }
-  if (!opened) {
-    try {
-      const ps1 = join(tmpdir(), `pi-child-watch-${process.pid}.ps1`);
-      writeFileSync(ps1, `Start-Process powershell -ArgumentList @('-NoExit','-Command','${tailCmd.replace(/'/g, "''")}')\r\n`);
-      spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ps1], {
-        windowsHide: true,
-        detached: true,
-        stdio: "ignore",
-      }).unref();
-      opened = "PowerShell Start-Process (new console window)";
-    } catch { /* fall through */ }
-  }
-  process.stderr.write(
-    opened
-      ? `[watch] activity window opened via ${opened}; log: ${watchLog}\n`
-      : `[watch] WARNING: could not open an activity window; log file: ${watchLog} (open it manually)\n`
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Supervision state
 // ---------------------------------------------------------------------------
@@ -536,8 +473,7 @@ function resetAttemptCounters() {
 // Compact progress log — ALWAYS written (no flag). One line per completed
 // tool call, plus [start]/[settled]/[result] markers. The parent session
 // should poll THIS small file instead of parsing the (multi-MB) session
-// jsonl. --watch's full mirror (pi-child-live.log) is separate and only
-// written under --watch.
+// jsonl.
 const progressLogPath = progressLogArg || join(process.cwd(), "pi-child-progress.log");
 writeFileSync(progressLogPath, "");
 const plog = (s) => { try { appendFileSync(progressLogPath, s); } catch { /* best effort */ } };

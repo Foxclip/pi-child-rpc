@@ -30,9 +30,8 @@
 //
 // Run from the directory the child should work in (it inherits this cwd).
 
-import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -44,9 +43,6 @@ Options:
   --model <m>         Model for the child (default: $PI_MODEL)
   --timeout <ms>      Per-turn timeout (default: 300000 = 5 min; RpcClient's
                       own default is only 60000, too short for slow local models)
-  --watch             Open a terminal window mirroring the child's live
-                      activity (text, tool calls, results) so a human can
-                      watch it; writes pi-child-live.log in the cwd
   --keep-question-tool  Do not exclude ask_user_question (child can then block
                       on extension-UI dialogs; you must answer them)
   --session-id <id>   Persist the child's session under this exact ID (created
@@ -67,7 +63,6 @@ let provider = process.env.PI_PROVIDER || "";
 let model = process.env.PI_MODEL || "";
 let timeoutMs = 5 * 60 * 1000;
 let keepQuestionTool = false;
-let watch = false;
 let sessionId = "";
 let sessionRef = "";
 let sessionDir = "";
@@ -79,7 +74,6 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--provider") provider = argv[++i];
   else if (a === "--model") model = argv[++i];
   else if (a === "--timeout") timeoutMs = Number(argv[++i]);
-  else if (a === "--watch") watch = true;
   else if (a === "--keep-question-tool") keepQuestionTool = true;
   else if (a === "--session-id") sessionId = argv[++i];
   else if (a === "--session") sessionRef = argv[++i];
@@ -93,7 +87,7 @@ for (let i = 0; i < argv.length; i++) {
     break;
   } else if (a.startsWith("--")) {
     console.error(`error: unknown flag "${a}" — unknown flags used to be silently treated as prompt text`);
-    console.error(`valid flags: --turn --provider --model --timeout --watch --keep-question-tool --session-id --session --session-dir --name -h --help`);
+    console.error(`valid flags: --turn --provider --model --timeout --keep-question-tool --session-id --session --session-dir --name -h --help`);
     console.error(`if your prompt starts with --, put a bare -- before it`);
     process.exit(2);
   } else positional.push(a);
@@ -175,72 +169,6 @@ if (model) args.push("--model", model);
 if (!keepQuestionTool) args.push("--exclude-tools", "ask_user_question");
 
 const client = new RpcClient({ cliPath, args });
-
-// --watch: mirror the child's activity to a live log file and open a terminal
-// window that tails it. The RPC child itself has NO TUI (its stdout is the
-// JSON protocol, by design), so visibility means forwarding its events, not
-// attaching a UI. The window is opened detached and outlives this script.
-if (watch) {
-  const watchLog = join(process.cwd(), "pi-child-live.log");
-  writeFileSync(watchLog, ""); // fresh file each run
-  const wlog = (s) => {
-    try { appendFileSync(watchLog, s); } catch { /* window/log best-effort */ }
-  };
-  client.onEvent((event) => {
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-      wlog(event.assistantMessageEvent.delta);
-    } else if (event.type === "message_start") wlog(`\n[message: ${event.message?.role ?? "?"}]\n`);
-    else if (event.type === "message_end") wlog("\n");
-    else if (event.type === "turn_start") wlog("\n=== turn start ===\n");
-    else if (event.type === "turn_end") wlog("\n=== turn end ===\n");
-    else if (event.type === "tool_execution_start")
-      wlog(`\n[tool] ${event.toolName} ${JSON.stringify(event.args ?? {}).slice(0, 300)}\n`);
-    else if (event.type === "tool_execution_end") {
-      const raw = typeof event.result === "string" ? event.result : JSON.stringify(event.result ?? "");
-      const dur = event.durationMs !== undefined ? ` (${event.durationMs}ms)` : "";
-      wlog(`[tool${event.isError ? " ERROR" : " done"}] ${event.toolName}${dur} :: ${raw.slice(0, 500).replace(/\n/g, " ⏎ ")}\n`);
-    } else if (event.type === "agent_settled") wlog("[settled]\n");
-  });
-  // Open a visible window tailing the log. Mechanisms, in order:
-  //  1. Windows Terminal (`wt new-tab`): wt is a GUI app, so it works from
-  //     any context, including console-less ones (agent tool sessions). It
-  //     opens a tab in the running WT window, or a new window.
-  //  2. PowerShell Start-Process via a temp .ps1 (deterministic quoting):
-  //     Start-Process opens a new window for the child console app.
-  // NOTE: the naive `cmd /c start ...` does NOT work in console-less contexts
-  // ("not a tty"): without a console, `start` silently fails to create a
-  // visible window (or, with an unquoted title, treats it as the program).
-  const tailCmd = `Get-Content '${watchLog}' -Wait -Encoding utf8`;
-  let opened = null;
-  try {
-    const wtPath = execFileSync("where.exe", ["wt"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim().split(/\r?\n/)[0];
-    if (wtPath) {
-      spawn(wtPath, ["new-tab", "powershell", "-NoExit", "-Command", tailCmd], {
-        windowsHide: true,
-        detached: true,
-        stdio: "ignore",
-      }).unref();
-      opened = "Windows Terminal (wt new-tab)";
-    }
-  } catch { /* no wt — fall through */ }
-  if (!opened) {
-    try {
-      const ps1 = join(tmpdir(), `pi-child-watch-${process.pid}.ps1`);
-      writeFileSync(ps1, `Start-Process powershell -ArgumentList @('-NoExit','-Command','${tailCmd.replace(/'/g, "''")}')\r\n`);
-      spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ps1], {
-        windowsHide: true,
-        detached: true,
-        stdio: "ignore",
-      }).unref();
-      opened = "PowerShell Start-Process (new console window)";
-    } catch { /* fall through */ }
-  }
-  if (opened) process.stderr.write(`[watch] activity window opened via ${opened}; log: ${watchLog}\n`);
-  else process.stderr.write(`[watch] WARNING: could not open an activity window; log file: ${watchLog} (open it manually)\n`);
-}
 
 const replies = [];
 let turnText = "";
