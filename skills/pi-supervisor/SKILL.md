@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use when a task needs a long-lived, isolated second pi — parallel work, a sub-conversation, or orchestrated follow-ups — that one-shot `pi --print` cannot cover. Also bundles supervisor.mjs for unattended long runs (loop/stall/degenerate-settle detection, steer/fork/stuck ladder, --expect-file completion artifacts, always-on progress log), a Docker 3-layer setup (scripts/docker/hypervisor.mjs) that runs supervisor and child in a container with the model on the host, and a low-integrity sandbox variant (scripts/integrity/hypervisor.mjs) for admin-free native-Windows sandboxing via Mandatory Integrity Control (no Docker, no UAC prompt).
+description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use when a task needs a long-lived, isolated second pi — parallel work, a sub-conversation, or orchestrated follow-ups — that one-shot `pi --print` cannot cover. Also bundles supervisor.mjs for unattended long runs (loop/stall/degenerate-settle detection, steer/fork/stuck ladder, --expect-file completion artifacts, always-on progress log), a Docker 3-layer setup (scripts/docker/hypervisor.mjs) that runs supervisor and child in a container with the model on the host, a low-integrity sandbox variant (scripts/integrity/hypervisor.mjs) for admin-free native-Windows sandboxing via Mandatory Integrity Control (no Docker, no UAC prompt), and a dedicated-user variant (scripts/user/hypervisor.mjs) that runs the child as a confined local Windows account (real NTFS-ACL boundary, in-place project access) over loopback SSH.
 ---
 
 # Interacting with a child pi process
@@ -15,6 +15,7 @@ A pi agent can spawn and converse with another pi agent. It is not limited to `a
 | One long autonomous job, unattended | **Supervised RPC** | `scripts/supervisor.mjs` (loop/stall detection + steer→fork→stuck ladder) |
 | One long autonomous job, sandboxed in a container | **Docker 3-layer** | `scripts/docker/hypervisor.mjs` (host) → supervisor + child in the container |
 | One long autonomous job, sandboxed without Docker/admin | **Low-IL sandbox** | `scripts/integrity/hypervisor.mjs` (native Windows, no UAC prompt) |
+| One long autonomous job, confined real account, in-place project | **Dedicated user** | `scripts/user/hypervisor.mjs` (loopback SSH to a confined local Windows account) |
 | In-process Node/Bun, full API | SDK | `createAgentSession()` from `@earendil-works/pi-coding-agent` |
 
 If the child's job is fire-and-forget with no ongoing dialogue, `acp_delegate` is usually better: clean context, async, result saved to a file.
@@ -360,6 +361,121 @@ model might default to bash idioms.
   main `~/.pi`; to inspect a run, look there.
 - Pre-existing files copied into the workdir *before* the icacls step (or
   left over with `--reuse`) keep Medium IL and are read-only for the child.
+
+## Dedicated-user variant (user variant — a real confined account, in-place project)
+
+Runs supervisor + child pi as a **dedicated standard local user** (default
+`agent`) so the child develops the project **in place** — the real repo, the
+real git state — while NTFS ACLs confine it to the project directory. Unlike
+the low-integrity variant (MIC blocks only *writes*, and only what the label
+policy covers), this is a real account boundary: reads of everything outside
+the grant are denied too. The host user (you) keeps full control; the child
+gets a grant on the project and deny-on-everything-else.
+
+**Architecture (all on this host):**
+
+```
+host user
+  `- node scripts/user/hypervisor.mjs
+       |- health-checks the model endpoint
+       |- stages supervisor.mjs + runner.mjs + selftest.ps1
+       |    into C:\ProgramData\pi-supervisor  (world-readable;
+       |    the only path both users can touch without a grant)
+       |- [mode selftest]  or [mode run]
+       `- ssh -i <key> agent@127.0.0.1 (loopback SSH, key-only after setup)
+            `- runner.mjs as the dedicated user
+                 |- bootstraps the per-run profile env (USERPROFILE/HOME/
+                 |  TEMP/PI_CODING_AGENT_DIR/PI_PACKAGE_DIR/GIT_CONFIG_*)
+                 |- writes the child's .pi config (models.json + auth.json)
+                 |  and .gitconfig (safe.directory = project)
+                 |- selftest: 11-check confinement matrix (exit 0/1)
+                 `- node supervisor.mjs (child pi, cwd = the project)
+```
+
+**Confinement (the ACL matrix, applied once — "tier 1" needs no admin):**
+- grant the user `(OI)(CI)M` on the project directory
+- deny `(OI)(CI)F` on every sibling of the project (its whole subtree) and
+  on the foreign top-level entries of the project's drive root; a partial
+  deny on the project's parent dir keeps the grant from leaking outward
+- the host user's home is already unreadable/unwritable to other users
+  under the standard Windows profile DACL — no action needed
+- "tier 2" (needs admin, optional): the drive root itself and foreign-owned
+  directories that resist icacls as a standard user (`$RECYCLE.BIN`,
+  `System Volume Information`, `Backup`, `Trash`, `MySQL`, ...). Ship as
+  `admin-tier2-<user>.bat`; run it elevated once. Tier-1 already blocks the
+  interesting targets; tier 2 closes the cosmetic gaps.
+
+Apply ACLs with `icacls` or .NET (`[IO.Directory]::SetAccessControl` — works
+when the `Microsoft.PowerShell.Security` module is broken, which also breaks
+`Get-Acl`/`ConvertTo-SecureString` on some installs; build SecureStrings via
+`[SecureString]::AppendChar` instead).
+
+**One-time setup (host user, no admin):**
+1. Create the account: `net user agent <pw> /add` (machine-wide node/git on
+   PATH are used by the child — true on this machine).
+2. Apply the tier-1 ACL matrix (above).
+3. SSH: `ssh-keygen -t ed25519` into a host-user-only dir, `icacls /inheritance:r
+   /grant <you>:F` on the dir + private key (ssh refuses group/world-readable
+   keys), then a ONE-TIME password login (env `SSH_ASKPASS_REQUIRE=force` +
+   an askpass.bat that echoes `%PI_AGENT_SSH_PASS%`, `DISPLAY` set) to append
+   the pubkey to the user's `%USERPROFILE%\.ssh\authorized_keys`. All later
+   launches are key-only (`-i <key>`). The key path is the `--key` flag.
+4. `node scripts/user/hypervisor.mjs --key <key> --setup "<project>"` —
+   bootstraps the user's profile dirs and installs the pi package into the
+   user's own `%APPDATA%\npm` (idempotent).
+5. `node scripts/user/hypervisor.mjs --key <key> --selftest "<project>"` —
+   the 11-check matrix (profile/project writable, git works, sibling + host
+   home reads/writes blocked, node/git/model reachable). Exit 0 before you
+   trust a real run.
+
+**Usage:** start the model server, then
+
+```
+node scripts/user/hypervisor.mjs --key <key> --project <dir> [supervisor options] "task"
+```
+
+Supervisor options (`--timeout`, `--expect-file`, `--loop-threshold`,
+`--max-forks`, `--max-errors`, `--consult`, ...) pass through unchanged. The
+child works **in place** on `<dir>` (git `safe.directory` is set for it via
+`GIT_CONFIG_GLOBAL`); commits, if the task asks for any, carry the child's
+`pi-child` git identity. Progress log, `=== RESULT ===` line and exit codes
+(0/1/2/3/4) match the other variants; the hypervisor additionally exits 90 on
+setup/selftest/model-health failure and 91 on spawn/ssh failure.
+
+**Hypervisor flags:**
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--user <name>` | dedicated Windows account | `agent` |
+| `--key <path>` | host-side ed25519 private key for loopback SSH | required |
+| `--project <dir>` | the in-place project the child is granted | required (setup/selftest take it positionally) |
+| `--model <id>` / `--provider <id>` | model id / provider id | `$PI_MODEL` / `localllama` |
+| `--model-base-url <u>` | model endpoint | `http://127.0.0.1:8080/v1` |
+| `--api-key <k>` | provider API key | `local` |
+| `--context-window <n>` | context window written into models.json | 262144 |
+| `--stage-dir <dir>` | script staging dir (must be readable by the user) | `C:\ProgramData\pi-supervisor` |
+| `--log <file>` | log file name (in the project) | `pi-child-hypervisor.log` |
+| `--setup` / `--selftest` | one-time profile+pi bootstrap / confinement matrix | off |
+
+**Gotchas (all E2E-proven):**
+- The user's profile dir DACL is locked against the host user on purpose —
+  NEVER write into `C:\Users\<user>` as the host (mkdir/icacls fail by
+  design); everything in there happens in-process as the user (profile
+  bootstrap is part of every run).
+- PS 5.1 drops empty-string args to natives (`ssh-keygen -N ''` → "Too many
+  arguments") — generate keys via `cmd /c`.
+- `-NoNewWindow` + `-WindowStyle` are mutually exclusive in Start-Process.
+- The child's `bash` tool resolved to **PowerShell 5.1** on this machine
+  (bash-idiom probes `ls && ...` failed instantly; `Get-ChildItem`/`if`
+  commands worked — the child self-corrected after ~2 failed probes). Task
+  text should say "PowerShell, no `&&`" up front, like the low-IL variant.
+- `Start-Process -Credential` / CreateProcessAsUser do NOT work for launching
+  as the user without admin (non-elevated token lacks SeImpersonatePrivilege
+  → `ERROR_NO_TOKEN` / ACCESS_DENIED); schtasks `/RU <user>` also needs
+  admin. Loopback SSH is the no-admin path.
+- Staged scripts (supervisor/runner/selftest) live in `C:\ProgramData\pi-
+supervisor`, NOT in the project — so a task that rewrites its own build
+  area cannot break the supervisor mid-run.
 
 ## Custom client (when the harness isn't enough)
 

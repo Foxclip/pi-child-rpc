@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.9.0 — 2026-10-16
+
+**Dedicated-user variant (`scripts/user/`) — the child runs as a confined
+local Windows account, working IN PLACE on the real project.** A third
+native-sandbox option, for when you want a real account boundary (reads
+outside the grant are denied too, unlike MIC which only blocks writes) and
+the child should develop the actual repo in place instead of a copy.
+
+- `scripts/user/hypervisor.mjs` — host-user orchestrator: model health
+  check, stages supervisor/runner/selftest into `C:\ProgramData\pi-
+supervisor`, launches via **loopback SSH with an ed25519 key**. SSH is the
+  no-admin launch path on Windows: `Start-Process -Credential` /
+  CreateProcessAsUser need SeImpersonatePrivilege (missing on non-elevated
+tokens → ERROR_NO_TOKEN / ACCESS_DENIED) and `schtasks /RU <user>` requires
+  admin.
+- `scripts/user/runner.mjs` — runs as the dedicated user: per-run profile
+  env bootstrap (USERPROFILE/HOME/TEMP/PI_CODING_AGENT_DIR/GIT_CONFIG_*),
+  child `.pi` config (models.json + auth.json) and `.gitconfig` (safe
+  .directory = project), plus `--setup` (profile dirs + pi install into the
+  user's own `%APPDATA%\npm`) and `--selftest` modes.
+- `scripts/user/selftest.ps1` — 11-check confinement matrix: profile +
+  project writable, project readable, git works in project, sibling dir +
+  host home blocked for write AND read, node/git/model reachable.
+- ACL matrix: **tier 1** (no admin, host user, one-time): `(OI)(CI)M`
+  grant on the project, deny on every sibling's subtree + foreign drive-
+  root entries, partial deny on the project's parent. **Tier 2** (admin
+  .bat, optional): the drive root and foreign-owned dirs that resist
+  icacls as a standard user (`$RECYCLE.BIN`, `System Volume Information`,
+  `Backup`, `Trash`, `MySQL`, ...).
+- SKILL.md: dedicated-user section (architecture, setup, flags, gotchas)
+  + variant table row.
+- E2E on the target machine: selftest 11/11 PASS; CMake + MSVC build of
+  `RUN_ALL_TESTS` on the real Box2D_Editor project as the first supervised
+  in-place run (child self-corrected from bash to PowerShell idioms after
+  ~2 probes; its `bash` tool resolved to PowerShell 5.1).
+
 ## v0.8.1 — 2026-10-15
 
 **Docs: README refresh (was lagging at v0.6.0).** Now documents all four
