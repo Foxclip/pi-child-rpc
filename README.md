@@ -1,6 +1,6 @@
-# pi-child-rpc
+# pi-supervisor
 
-Pi package containing the **pi-child-rpc** skill: spawn a second pi agent as a
+Pi package containing the **pi-supervisor** skill: spawn a second pi agent as a
 child process (RPC mode) and hold a multi-turn, bidirectional conversation
 with it from inside a pi session.
 
@@ -19,15 +19,15 @@ The skill bundles two ready-to-run scripts:
 
 ```bash
 # pin a tag
-pi install git:github.com/Foxclip/pi-child-rpc@v0.2.0
+pi install git:github.com/Foxclip/pi-supervisor@v0.6.0
 
 # try it for one invocation without installing
-pi -e git:github.com/Foxclip/pi-child-rpc
+pi -e git:github.com/Foxclip/pi-supervisor
 ```
 
 ## What you get
 
-The `pi-child-rpc` skill, which pi loads when a task needs a long-lived second
+The `pi-supervisor` skill, which pi loads when a task needs a long-lived second
 pi agent. Quick usage (run from the directory the child should work in):
 
 ```bash

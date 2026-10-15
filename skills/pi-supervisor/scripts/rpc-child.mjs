@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // rpc-child.mjs — spawn a child pi agent (RPC mode) and hold a multi-turn
-// conversation with it. Bundled with the pi-child-rpc skill.
+// conversation with it. Bundled with the pi-supervisor skill.
 //
 // Usage:
 //   node rpc-child.mjs "one-shot prompt"

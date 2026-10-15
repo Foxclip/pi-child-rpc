@@ -1,5 +1,5 @@
 ---
-name: pi-child-rpc
+name: pi-supervisor
 description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use when a task needs a long-lived, isolated second pi — parallel work, a sub-conversation, or orchestrated follow-ups — that one-shot `pi --print` cannot cover. Also bundles supervisor.mjs for unattended long runs (loop/stall/degenerate-settle detection, steer/fork/stuck ladder, --expect-file completion artifacts, always-on progress log) and a Docker 3-layer setup (scripts/docker/hypervisor.mjs) that runs supervisor and child in a container with the model on the host.
 ---
 
@@ -172,9 +172,9 @@ node <skill_dir>/scripts/docker/hypervisor.mjs "long autonomous task" [options]
 Run it from the directory the child should work in (that is `--workdir`,
 mounted at `/work`). The hypervisor then: generates the container's agent
 config under `<workdir>/.pi-docker/agent/` (models.json + auth.json; session
-files created later land there too), builds the image `pi-child-rpc:docker`
+files created later land there too), builds the image `pi-supervisor:docker`
 if missing (bundled `scripts/docker/Dockerfile`: node + global pi install;
-skill scripts are bind-mounted at `/opt/pi-child-rpc` so skill updates never
+skill scripts are bind-mounted at `/opt/pi-supervisor` so skill updates never
 require an image rebuild), starts the host model forwarder, health-checks the
 model endpoint, launches the container, and watches it.
 
@@ -202,7 +202,7 @@ Hypervisor-only:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--image <name>` | `pi-child-rpc:docker` | container image; built from the bundled Dockerfile if missing |
+| `--image <name>` | `pi-supervisor:docker` | container image; built from the bundled Dockerfile if missing |
 | `--docker <cmd>` | `docker` | container runtime command |
 | `--workdir <dir>` | cwd | host dir mounted at `/work`; child works there |
 | `--model-base-url <u>` | `http://host.docker.internal:8081/v1` | model URL **from the container** |
@@ -258,7 +258,7 @@ live under `<workdir>/.pi-docker/agent/sessions/`).
 
 The hypervisor is a plain node script (no shell involved), so MSYS
 path-mangling does not apply. Bind mounts are used for the workdir and the
-skill scripts dir (read-only at `/opt/pi-child-rpc`). `--watch` opens a host
+skill scripts dir (read-only at `/opt/pi-supervisor`). `--watch` opens a host
 window via `wt`/PowerShell, as in the rest of the skill.
 
 ## Custom client (when the harness isn't enough)

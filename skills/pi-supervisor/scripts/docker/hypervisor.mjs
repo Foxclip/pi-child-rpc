@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// hypervisor.mjs — the HOST layer of the 3-layer pi-child-rpc docker setup.
+// hypervisor.mjs — the HOST layer of the 3-layer pi-supervisor docker setup.
 //
 //   host:      hypervisor.mjs (this file)
 //                |- generates the container's agent config (models.json + auth.json)
@@ -32,7 +32,7 @@
 //   --keep-question-tool --keep-delegate-tool
 //
 // Hypervisor options:
-//   --image <name>         Container image (default pi-child-rpc:docker; built
+//   --image <name>         Container image (default pi-supervisor:docker; built
 //                          from the bundled Dockerfile if missing)
 //   --docker <cmd>         Container runtime command (default: docker)
 //   --workdir <dir>        Host working directory mounted at /work (default: cwd).
@@ -88,7 +88,7 @@ const USAGE = `Usage:
 Supervisor options are passed through unchanged; see supervisor.mjs --help.
 
 Hypervisor options:
-  --image <name>         Container image (default pi-child-rpc:docker)
+  --image <name>         Container image (default pi-supervisor:docker)
   --docker <cmd>         Container runtime (default: docker)
   --workdir <dir>        Host dir mounted at /work (default: cwd)
   --model-base-url <u>   Model URL from the CONTAINER (default http://host.docker.internal:8081/v1)
@@ -133,7 +133,7 @@ const argv = process.argv.slice(2);
 const supArgs = [];
 let task = "";
 const opt = {
-  image: "pi-child-rpc:docker",
+  image: "pi-supervisor:docker",
   docker: "docker",
   workdir: process.cwd(),
   modelBaseUrl: "http://host.docker.internal:8081/v1",
@@ -261,7 +261,7 @@ let progressLogHost = join(workdir, "pi-child-progress.log");
   }
 }
 const logPath = isAbsolute(opt.log) ? opt.log : join(workdir, opt.log || "pi-child-hypervisor.log");
-const containerName = `pi-child-rpc-${Date.now().toString(36)}`;
+const containerName = `pi-supervisor-${Date.now().toString(36)}`;
 
 const startedAt = Date.now();
 function log(msg) {
@@ -406,13 +406,13 @@ function dockerRunArgs() {
   if (!opt.keepContainer) a.push("--rm");
   a.push("--name", containerName, "-i");
   a.push("-v", `${winPath(workdir)}:/work`);
-  a.push("-v", `${winPath(SCRIPTS_DIR)}:/opt/pi-child-rpc:ro`);
+  a.push("-v", `${winPath(SCRIPTS_DIR)}:/opt/pi-supervisor:ro`);
   a.push("--add-host=host.docker.internal:host-gateway");
   a.push("-e", `PI_CODING_AGENT_DIR=${agentDirC}`);
   a.push("-e", `PI_PROVIDER=${opt.provider}`);
   a.push("-e", `PI_MODEL=${opt.model}`);
   if (process.env.PI_REASONING_LEVEL) a.push("-e", `PI_REASONING_LEVEL=${process.env.PI_REASONING_LEVEL}`);
-  a.push(opt.image, "node", "/opt/pi-child-rpc/supervisor.mjs");
+  a.push(opt.image, "node", "/opt/pi-supervisor/supervisor.mjs");
   a.push(...containerSupArgs());
   return a;
 }

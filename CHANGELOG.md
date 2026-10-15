@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.6.0 — 2026-10-15
+
+**Rename: `pi-child-rpc` → `pi-supervisor`.** The repo was renamed on
+GitHub (`Foxclip/pi-child-rpc` → `Foxclip/pi-supervisor`) and the skill takes
+the same name. Nothing else changed.
+
+- Skill: frontmatter `name: pi-supervisor`, folder `skills/pi-supervisor/`
+  (the skill's invocation is now `pi-supervisor`, e.g. `/skill:pi-supervisor`).
+- Install pin: `git:github.com/Foxclip/pi-supervisor@v0.6.0` (the old pin
+  `git:github.com/Foxclip/pi-child-rpc@...` is dead — GitHub redirects the old
+  repo URL, but the pi package path no longer matches).
+- Package metadata: `package.json` name `pi-supervisor`, version 0.6.0
+  (also syncing the version field, which had lagged at 0.4.0 since v0.4.0),
+  repository URL updated; `package-lock.json` synced.
+- Docker artifacts renamed: image `pi-supervisor:docker` (an existing local
+  `pi-child-rpc:docker` image is NOT reused — the first run after the rename
+  builds a fresh one), bind mount `/opt/pi-child-rpc` → `/opt/pi-supervisor`,
+  container name prefix `pi-child-rpc-` → `pi-supervisor-`.
+- NOT renamed: the `pi-child-*` runtime artifact file names
+  (`pi-child-progress.log`, `pi-child-consult.json`, `pi-child-hypervisor.log`,
+  `pi-child-live.log`) — they name the child pi process, stay stable across
+  the rename, and keep in-progress/monitoring runs working.
+- Historical CHANGELOG entries keep their original names.
+
 ## v0.5.0 — 2026-10-15
 
 New variant: the 3-layer Docker run. The skill now has two variants — host
