@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.8.1 — 2026-10-15
+
+**Docs: README refresh (was lagging at v0.6.0).** Now documents all four
+scripts + test suite: the Docker 3-layer variant
+(`scripts/docker/hypervisor.mjs`) and the low-integrity sandbox variant
+(`scripts/integrity/`), consult mode (`--consult` / `--consult-file` /
+`--action`), `--expect-file` artifacts, sensors, and the always-on compact
+progress log as the monitoring surface. Install pin updated to @v0.8.1.
+No code changes.
+
 ## v0.8.0 — 2026-10-15
 
 **Removed: the `--watch` live activity window (all variants).** The
