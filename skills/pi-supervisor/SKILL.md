@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use when a task needs a long-lived, isolated second pi — parallel work, a sub-conversation, or orchestrated follow-ups — that one-shot `pi --print` cannot cover. Also bundles supervisor.mjs for unattended long runs (loop/stall/degenerate-settle detection, steer/fork/stuck ladder, --expect-file completion artifacts, always-on progress log) and a Docker 3-layer setup (scripts/docker/hypervisor.mjs) that runs supervisor and child in a container with the model on the host.
+description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use when a task needs a long-lived, isolated second pi — parallel work, a sub-conversation, or orchestrated follow-ups — that one-shot `pi --print` cannot cover. Also bundles supervisor.mjs for unattended long runs (loop/stall/degenerate-settle detection, steer/fork/stuck ladder, --expect-file completion artifacts, always-on progress log), a Docker 3-layer setup (scripts/docker/hypervisor.mjs) that runs supervisor and child in a container with the model on the host, and a low-integrity sandbox variant (scripts/integrity/hypervisor.mjs) for admin-free native-Windows sandboxing via Mandatory Integrity Control (no Docker, no UAC prompt).
 ---
 
 # Interacting with a child pi process
@@ -14,6 +14,7 @@ A pi agent can spawn and converse with another pi agent. It is not limited to `a
 | Multi-turn, bidirectional | **RPC mode** | `scripts/rpc-child.mjs` in this skill, or a custom `RpcClient` script |
 | One long autonomous job, unattended | **Supervised RPC** | `scripts/supervisor.mjs` (loop/stall detection + steer→fork→stuck ladder) |
 | One long autonomous job, sandboxed in a container | **Docker 3-layer** | `scripts/docker/hypervisor.mjs` (host) → supervisor + child in the container |
+| One long autonomous job, sandboxed without Docker/admin | **Low-IL sandbox** | `scripts/integrity/hypervisor.mjs` (native Windows, no UAC prompt) |
 | In-process Node/Bun, full API | SDK | `createAgentSession()` from `@earendil-works/pi-coding-agent` |
 
 If the child's job is fire-and-forget with no ongoing dialogue, `acp_delegate` is usually better: clean context, async, result saved to a file.
@@ -260,6 +261,107 @@ The hypervisor is a plain node script (no shell involved), so MSYS
 path-mangling does not apply. Bind mounts are used for the workdir and the
 skill scripts dir (read-only at `/opt/pi-supervisor`). `--watch` opens a host
 window via `wt`/PowerShell, as in the rest of the skill.
+
+## Low-integrity sandbox (integrity variant — no admin, no Docker)
+
+Runs supervisor + child pi **natively on Windows** inside a **Low integrity**
+process tree (Mandatory Integrity Control, `S-1-16-4096`). The child pi can
+write wherever it likes *except* the sandbox directories the hypervisor
+created: user profile, HKCU registry, Program Files and all system locations
+are write-protected. No admin, no elevation, no UAC prompt, no Docker,
+no Hyper-V — the downgrade is a plain `SetTokenInformation` on the process's
+own token, which Windows allows without any privilege.
+
+**Architecture (3 layers, all on this host):**
+
+```
+Medium-IL hypervisor  scripts/integrity/hypervisor.mjs (node)
+  |- creates <base>/{work,home,temp} and icacls's them (OI)(CI)Low
+  |    [must happen while still Medium: a Low process cannot create
+  |     directories in Medium-IL parents]
+  |- generates the child's agent config (<home>/.pi/models.json,
+  |    openai-completions -> --model-base-url; settings.json pins the
+  |    bash tool's shellPath to PowerShell — see Windows-development note)
+  |- health-checks the model endpoint (GET .../v1/models)
+  |- [optional] copies --src project files into work/
+  `- spawn-low.ps1  (self-downgrades the token to Low)
+       `- node supervisor.mjs   (supervisor + child pi at Low IL, cwd = work,
+          isolated HOME/USERPROFILE/TEMP under <base>\home)
+```
+
+No model forwarder is needed: the child is on this host, so
+`--model-base-url` points straight at the model server (default
+`http://127.0.0.1:8080/v1`) — no port remapping like the Docker variant.
+
+**Protection matrix (verified by `--selftest`):**
+- child writes to user profile, HKCU registry, system dirs → **DENIED**
+- child writes into the sandbox work/home/temp dirs → allowed
+- child READs of any file → allowed (integrity never blocks reads)
+- child execution of host programs → allowed
+- network access → **NOT restricted** (closing it off needs admin; use the
+  Docker variant if network isolation matters)
+- afterwards you (Medium) can still read/write everything in work/
+
+**Setup:** none — nothing to install or pre-run. Verify with
+`node scripts/integrity/hypervisor.mjs --selftest` (prints 5 PASS checks,
+exit 0). If a Windows update ever changes the token rules, this fails
+loudly instead of silently letting the child run unsandboxed.
+
+**Usage:** start the model server, then
+
+```
+node scripts/integrity/hypervisor.mjs --model <id> [supervisor options] "task"
+```
+
+Supervisor options (`--timeout`, `--expect-file`, `--loop-threshold`,
+`--max-forks`, `--max-errors`, `--consult`, ...) pass through unchanged —
+see `supervisor.mjs --help`. Progress log, `=== RESULT ===` line and exit
+codes (0 completed / 1 infrastructure / 2 usage / 3 stuck / 4 consult) are
+identical to the other variants; the hypervisor additionally exits 90 on
+sandbox-setup or selftest failure and propagates 91 from spawn-low.ps1 if
+the downgrade itself fails.
+
+**Hypervisor flags:**
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--base <dir>` | sandbox root (work/home/temp live here) | `%USERPROFILE%\pi-supervisor-sandbox` |
+| `--workdir <dir>` | child work area; must be empty unless `--reuse` | `<base>\work` |
+| `--src <dir>` | copy this directory into the workdir before launch | — |
+| `--reuse` | allow a pre-existing non-empty workdir (its old files are Medium IL — the child cannot modify them) | off |
+| `--model <id>` / `--provider <id>` | model id / provider id (the child gets its own fresh agent dir, so `localllama` never collides) | `$PI_MODEL` / `localllama` |
+| `--model-base-url <u>` | model endpoint | `http://127.0.0.1:8080/v1` |
+| `--context-window <n>` | context window written into the child's models.json | 262144 |
+| `--task <t>` / positional | task text | required |
+| `--selftest` | run the isolation selftest and exit | off |
+| `--log <file>` | log file name (in the workdir) | `pi-child-hypervisor.log` |
+
+**Windows-development note:** the child keeps the host's full native
+toolchain — e.g. on a machine with Visual Studio 2022 Community, MSVC C++
+(`cl.exe`) and CMake are available; build with
+`cmake -S . -B build -G "Visual Studio 17 2022"` and every artifact lands
+in `work/` (readable by you afterwards). Every process the child spawns
+inherits Low IL, so the confinement holds for the whole build/test tree.
+
+**Shell note (task authors!):** the child's `bash` tool runs **Windows
+PowerShell, not bash** — Git-bash (MSYS2) cannot start at Low integrity
+(it must create `\BaseNamedObjects\msys-2.0S5-<hash>`, which MIC denies
+Low-IL creation). The hypervisor writes `shellPath` (pwsh if on PATH, else
+PowerShell 5.1) into the child's agent `settings.json`. So task text and
+build/run commands must use PowerShell syntax: `cmake ... ; cmake --build
+build --config Release` then `.\build\Release\demo.exe` — backslash paths,
+`Set-Content`/`Out-File`, no `&&` on 5.1. Say this in the task if the
+model might default to bash idioms.
+
+**Gotchas:**
+- The self-downgrade uses the exact access mask the current OS grants the
+  Medium token (`TOKEN_QUERY | TOKEN_ADJUST_DEFAULT`, 0x88) and the label
+  buffer size `GetTokenInformation` reports (28 bytes on current Windows, not
+  the textbook 24). Other masks (e.g. `TOKEN_ADJUST_GROUPS`) are denied.
+- The child's pi agent dir is `<base>\home\.pi` — sessions are NOT in your
+  main `~/.pi`; to inspect a run, look there.
+- Pre-existing files copied into the workdir *before* the icacls step (or
+  left over with `--reuse`) keep Medium IL and are read-only for the child.
 
 ## Custom client (when the harness isn't enough)
 

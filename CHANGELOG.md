@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.7.0 — 2026-10-15
+
+**Low-integrity sandbox variant (`scripts/integrity/`) — native Windows,
+no admin, no Docker, no UAC prompt.** A third way to run long supervised
+jobs, for machines (like this one) where the user is a standard account and
+wants real confinement without installing or elevating anything.
+
+- `scripts/integrity/hypervisor.mjs` — Medium-IL orchestrator. Creates
+  `<base>/{work,home,temp}` under `%USERPROFILE%\pi-supervisor-sandbox` and
+  icacls's them `(OI)(CI)Low`; writes the child's own agent config
+  (`models.json` + `auth.json`, openai-completions → `--model-base-url`,
+  and `settings.json` with `shellPath` → PowerShell, because Git-bash/MSYS2
+  cannot start at Low integrity — the child's bash tool runs PowerShell, so
+  task text must use PowerShell syntax); health-checks the model; copies
+  `--src` project files; then spawns the
+  Low-IL tree. No model forwarder (child is on this host). Supervisor
+  options pass through unchanged; same `=== RESULT ===` line, progress log
+  and exit codes as the other variants; 90 = sandbox setup/selftest failure.
+  `--selftest` runs the isolation checks and exits 0/90.
+- `scripts/integrity/spawn-low.ps1` — the downgrade itself:
+  `OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_DEFAULT)`
+  (0x88 — the only mask the current OS grants for this) +
+  `SetTokenInformation(TokenIntegrityLevel)` with the OS-reported label size
+  (28 bytes; the textbook 24 fails), target SID `S-1-16-4096` (Low).
+  Takes the command as a single base64-encoded JSON `-Spec` argument
+  (base64 because PS 5.1 command-line quoting mangles raw JSON's escaped
+  quotes; and the decoded object is kept in `$specObj`, never `$spec` —
+  PS member access is case-insensitive, so `$spec.Exe` would read the
+  string param and stringify it). Pure ASCII (PS 5.1 cp1252 pitfall).
+  Exits 91 on downgrade failure.
+- E2E-verified on the authoring machine (VS2022 Community + CMake 4.0.3):
+  child built a C++ project in the Low-IL sandbox (`cl.exe`), ran the
+  binary, wrote `out.txt`/`done.txt`; passed on both gemma-4-26B and
+  Qwen3.8-27B (~30 s–2 min per run).
+- `scripts/integrity/selftest.ps1` — 5 checks, all verified PASS on the
+  authoring machine: userprofile write blocked, HKCU write blocked,
+  Low-IL dir write allowed, child process inherits Low, Medium-IL reads
+  still work.
+- SKILL.md: interface-table row + full section (architecture, protection
+  matrix, flags, MSVC/CMake + PowerShell-shell notes, gotchas).
+
+Protection boundary: integrity confinement is write-only — the child can
+READ everything and the network is unrestricted (both would need admin or a
+container to close). Use the Docker variant when network isolation matters;
+use this one for admin-free file/registry confinement of long native runs.
+
 ## v0.6.0 — 2026-10-15
 
 **Rename: `pi-child-rpc` → `pi-supervisor`.** The repo was renamed on
