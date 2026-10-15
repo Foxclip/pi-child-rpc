@@ -2,13 +2,23 @@
 # Verifies the confinement matrix + toolchain. Exit 0 = PASS.
 #
 #   -Project <dir>   the project the child must be able to read+write
-#   -DenyDir <dir>   a directory that must be fully DENIED (read+write)
+#   -DenyDir <dir>   a directory OUTSIDE the project; the expectations follow
+#                    -ReadsMode (must match the mode apply-denies.ps1 was
+#                    applied with, or this selftest fails loudly)
+#   -ReadsMode m     'deny' (default) = DenyDir reads AND writes blocked
+#                                       (full (OI)(CI)F deny)
+#                    'allow'          = DenyDir follows the default ACLs - on
+#                                       this machine reads AND writes both
+#                                       succeed (AuthUsers Modify on E:)
 #   -HostUser <name> the host account; C:\Users\<name> must be DENIED
+#                    (read AND write, in BOTH modes — the Windows default
+#                    profile DACL blocks it, independent of the tier-1 matrix)
 #   -ModelPort <n>   model server port reachable on 127.0.0.1 (default 8080)
 param(
   [string]$Project,
   [string]$DenyDir = '',
   [string]$HostUser = '',
+  [ValidateSet('deny','allow')][string]$ReadsMode = 'deny',
   [int]$ModelPort = 8080
 )
 $ErrorActionPreference = 'Continue'
@@ -55,9 +65,17 @@ if ($Project) {
 # 3. deny zones
 if ($DenyDir) {
   $dw = Probe-Write "$DenyDir\selftest-probe.txt"
-  Check "deny-dir write blocked" ($dw -eq 'DENIED') "$dw ($DenyDir)"
+  if ($ReadsMode -eq 'deny') {
+    Check "deny-dir write blocked" ($dw -eq 'DENIED') "$dw ($DenyDir)"
+  } else {
+    Check "deny-dir write allowed (default ACLs)" ($dw -eq 'WRITTEN') "$dw ($DenyDir)"
+  }
   $dr = Probe-Read $DenyDir
-  Check "deny-dir read blocked" ($dr -eq 'DENIED') $dr
+  if ($ReadsMode -eq 'deny') {
+    Check "deny-dir read blocked" ($dr -eq 'DENIED') $dr
+  } else {
+    Check "deny-dir read allowed" ($dr -eq 'READABLE') $dr
+  }
 }
 if ($HostUser) {
   $hh = "C:\Users\$HostUser"

@@ -81,9 +81,13 @@ writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ shellPath: shell
 
 // git: the project is owned by the host user, so the child (different user)
 // needs safe.directory to avoid "dubious ownership".
+// NOTE: backslashes are ESCAPE characters in git config values - a raw
+// Windows path (E:\Projects\Box2D_Editor) yields "fatal: bad config line 2".
+// Git accepts forward slashes on Windows, so normalize them.
+const safeDir = spec.project.replace(/\\/g, "/");
 const gitconfigPath = join(home, ".gitconfig");
 writeFileSync(gitconfigPath,
-  `[safe]\n\tdirectory = ${spec.project}\n[user]\n\tname = pi-child\n\temail = pi-child@local\n`);
+  `[safe]\n\tdirectory = ${safeDir}\n[user]\n\tname = pi-child\n\temail = pi-child@local\n`);
 
 // ---------------------------------------------------------------------------
 // Env for the supervisor + child

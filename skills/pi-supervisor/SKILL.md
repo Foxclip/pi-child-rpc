@@ -368,9 +368,11 @@ Runs supervisor + child pi as a **dedicated standard local user** (default
 `agent`) so the child develops the project **in place** — the real repo, the
 real git state — while NTFS ACLs confine it to the project directory. Unlike
 the low-integrity variant (MIC blocks only *writes*, and only what the label
-policy covers), this is a real account boundary: reads of everything outside
-the grant are denied too. The host user (you) keeps full control; the child
-gets a grant on the project and deny-on-everything-else.
+policy covers), this is a real account boundary: in the default `deny` reads
+mode, reads of everything outside the grant are denied too (`--reads allow`
+relaxes outside *reads* while the write seal stays — see **Reads mode**
+below). The host user (you) keeps full control; the child gets a grant on
+the project and deny-on-everything-else.
 
 **Architecture (all on this host):**
 
@@ -405,6 +407,27 @@ host user
   `admin-tier2-<user>.bat`; run it elevated once. Tier-1 already blocks the
   interesting targets; tier 2 closes the cosmetic gaps.
 
+**Reads mode (`--reads deny|allow`, default `deny`):** the write confinement
+is identical in both modes (project grant; zone-root create/delete denied;
+host home sealed by the profile DACL). The flag only controls the sibling
+deny matrix:
+- `deny` — full denies on every sibling subtree of the project's parent
+  (plus the foreign drive-root entries): the child cannot even *list* what
+  is outside its grant. The strictest option.
+- `allow` — no sibling denies: the child can read (and, per the default
+  ACLs, write) elsewhere on the machine — e.g. to consult a reference repo
+  or docs — while its own project stays the only in-place write zone it
+  cares about.
+
+The matrix is applied by `scripts/user/apply-denies.ps1` (idempotent:
+cleans every `agent` ACE on the project's drive zone, then re-applies per
+mode). The hypervisor probes one sibling with a single `icacls` call before
+every run and skips the full re-apply (measured ~6 min on a ~200-sibling
+tree) when the tree is already in the requested mode. `--selftest`
+verifies the matching matrix per mode: in `allow` the sibling read/write
+probes must *succeed*, in `deny` both must be blocked. Both matrices are
+live-verified (11/11 in each mode).
+
 Apply ACLs with `icacls` or .NET (`[IO.Directory]::SetAccessControl` — works
 when the `Microsoft.PowerShell.Security` module is broken, which also breaks
 `Get-Acl`/`ConvertTo-SecureString` on some installs; build SecureStrings via
@@ -413,7 +436,10 @@ when the `Microsoft.PowerShell.Security` module is broken, which also breaks
 **One-time setup (host user, no admin):**
 1. Create the account: `net user agent <pw> /add` (machine-wide node/git on
    PATH are used by the child — true on this machine).
-2. Apply the tier-1 ACL matrix (above).
+2. Apply the tier-1 ACL matrix (above) — `scripts/user/apply-denies.ps1 -User
+   agent -Project <dir> -Mode deny|allow`; the hypervisor also applies it
+   itself before setup/selftest/run (skipping when already in the requested
+   mode).
 3. SSH: `ssh-keygen -t ed25519` into a host-user-only dir, `icacls /inheritance:r
    /grant <you>:F` on the dir + private key (ssh refuses group/world-readable
    keys), then a ONE-TIME password login (env `SSH_ASKPASS_REQUIRE=force` +
@@ -425,13 +451,14 @@ when the `Microsoft.PowerShell.Security` module is broken, which also breaks
    user's own `%APPDATA%\npm` (idempotent).
 5. `node scripts/user/hypervisor.mjs --key <key> --selftest "<project>"` —
    the 11-check matrix (profile/project writable, git works, sibling + host
-   home reads/writes blocked, node/git/model reachable). Exit 0 before you
-   trust a real run.
+   home blocked or open per reads mode, node/git/model reachable). Pass the
+   same `--reads` mode you will run with — the matrix is mode-aware. Exit 0
+   before you trust a real run.
 
 **Usage:** start the model server, then
 
 ```
-node scripts/user/hypervisor.mjs --key <key> --project <dir> [supervisor options] "task"
+node scripts/user/hypervisor.mjs --key <key> --project <dir> --reads deny|allow [supervisor options] "task"
 ```
 
 Supervisor options (`--timeout`, `--expect-file`, `--loop-threshold`,
@@ -449,6 +476,7 @@ setup/selftest/model-health failure and 91 on spawn/ssh failure.
 | `--user <name>` | dedicated Windows account | `agent` |
 | `--key <path>` | host-side ed25519 private key for loopback SSH | required |
 | `--project <dir>` | the in-place project the child is granted | required (setup/selftest take it positionally) |
+| `--reads <mode>` | outside reads: `deny` (sealed) or `allow` (open; outside writes sealed either way) | `deny` |
 | `--model <id>` / `--provider <id>` | model id / provider id | `$PI_MODEL` / `localllama` |
 | `--model-base-url <u>` | model endpoint | `http://127.0.0.1:8080/v1` |
 | `--api-key <k>` | provider API key | `local` |

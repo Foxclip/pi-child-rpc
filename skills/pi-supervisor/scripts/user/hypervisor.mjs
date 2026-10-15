@@ -19,8 +19,17 @@
 //
 // What the dedicated user confines (verified by --selftest):
 //   - writes to the project dir and the user's own profile: ALLOWED
-//   - writes/reads/deletes everywhere else on the confined drive: DENIED
-//     (full deny ACE for the user's SID, (OI)(CI) on each directory)
+//   - everything OUTSIDE the project subtree: reads mode --reads
+//       deny  (default) = DENIED, reads AND writes (full (OI)(CI)F denies)
+//       allow = default Windows ACLs — on this machine E: allows both reads
+//               and writes (the account behaves like a normal logged-on
+//               user; C:\Users\<host> stays blocked by its profile DACL)
+//     Applied idempotently before every run via apply-denies.ps1 (skipped
+//     when the sibling probe shows the tree is already in the requested
+//     mode); the selftest verifies the ACTIVE mode and fails loudly on
+//     mismatch. Note: "allow reads, deny writes" is NOT expressible with
+//     icacls deny masks on this Windows build (probed: every write-mask
+//     deny also blocks reads), hence the two modes above.
 //   - the user's own .pi dir is where ALL child state lives (sessions, logs)
 //   - network access is NOT restricted (same as the integrity variant)
 //   - the user can still execute any host program (standard-user level)
@@ -29,8 +38,10 @@
 //   1. a standard local account (default "agent") with an SSH key you control
 //      in its %USERPROFILE%\.ssh\authorized_keys (or a known password for the
 //      first login)
-//   2. NTFS deny ACEs for that account's SID on every directory it must not
-//      touch (the setup script ships with this variant: apply-denies.ps1)
+//   2. reads-mode ACEs (the hypervisor applies them automatically before
+//      every run via apply-denies.ps1; manual form:
+//      `powershell -File apply-denies.ps1 -User agent -Project <dir>
+//      -Reads deny|allow -Apply`)
 //   3. pi installed for that account: `node hypervisor.mjs --setup`
 //
 // Usage:
@@ -66,7 +77,7 @@ function die(msg, code) {
 const RESERVABLE = new Set([
   "user", "key", "project", "model", "provider", "model-base-url", "api-key",
   "context-window", "task", "selftest", "setup", "stage", "skip-health",
-  "log", "host", "help", "h",
+  "log", "host", "reads", "help", "h",
 ]);
 const opt = {
   user: "agent",
@@ -84,6 +95,7 @@ const opt = {
   stage: "C:\\ProgramData\\pi-supervisor",
   skipHealth: false,
   log: "pi-child-hypervisor.log",
+  reads: "deny",
 };
 const supArgs = [];
 let task = "";
@@ -108,6 +120,14 @@ options:
   --selftest             verify confinement + toolchain as the account, then exit
   --skip-health          skip the model endpoint health check
   --log <file>           log file name (default pi-child-hypervisor.log in project)
+  --reads deny|allow     outside reads mode, applied idempotently via
+                         apply-denies.ps1 before every run (skipped if the
+                         tree is already in this mode). Default "deny":
+                         deny  = the account can neither read nor write
+                                 anything outside the project (sealed)
+                         allow = the account gets the default Windows ACLs
+                                 outside (on this machine E: allows both
+                                 reads and writes)
   <task>                 positional task text
   everything else        passed through to supervisor.mjs (see its --help)
 
@@ -156,6 +176,9 @@ for (let i = 0; i < argv.length; i++) {
     case "stage": opt.stage = resolve(v); break;
     case "skip-health": opt.skipHealth = true; break;
     case "log": opt.log = v; break;
+    case "reads":
+      if (v !== "deny" && v !== "allow") die(`error: --reads must be "deny" or "allow" (got "${v}")`, 2);
+      opt.reads = v; break;
     default: break;
   }
   i++;
@@ -200,6 +223,55 @@ function stage() {
     copyFileSync(src, join(opt.stage, f));
   }
   log(`staged supervisor.mjs + runner.mjs + selftest.ps1 -> ${opt.stage}`);
+}
+
+// ---------------------------------------------------------------------------
+// Reads mode — apply-denies.ps1 (runs locally as the host user, idempotent)
+// ---------------------------------------------------------------------------
+function detectReadsMode() {
+  // Probe = the first sibling directory of the project (same pick as the
+  // selftest): full (OI)(CI)F agent deny => "deny"; no agent ACE =>
+  // "allow"; anything else (or unreadable) => "unknown" (force re-apply).
+  let sample = "";
+  try {
+    const parent = dirname(opt.project);
+    for (const n of readdirSync(parent)) {
+      if (n === basename(opt.project)) continue;
+      const p = join(parent, n);
+      try { if (statSync(p).isDirectory()) { sample = p; break; } } catch { /* gone */ }
+    }
+  } catch { /* fall through */ }
+  if (!sample) return "unknown";
+  let out = "";
+  try { out = execFileSync("icacls", [sample], { encoding: "utf8" }); } catch { return "unknown"; }
+  const agentLines = out.split(/\r?\n/).filter((l) => l.includes(opt.user + ":"));
+  if (agentLines.length === 0) return "allow";
+  // F = full-control deny, N = NO_ACCESS deny (the legacy tier-1 setup used N)
+  if (agentLines.some((l) => /\bF\b|\bN\b/.test(l))) return "deny";
+  return "unknown";
+}
+
+function applyReadsMode() {
+  const cur = detectReadsMode();
+  if (cur === opt.reads) {
+    log(`reads mode already "${opt.reads}" (sibling probe) — skipping apply-denies.ps1`);
+    return;
+  }
+  const ps = join(USER_DIR, "apply-denies.ps1");
+  if (!existsSync(ps)) die(`error: missing skill file: ${ps}`, 90);
+  log(`applying reads mode "${opt.reads}" (detected: ${cur}) via apply-denies.ps1 ...`);
+  const t = Date.now();
+  const r = spawnSync("powershell.exe", [
+    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps,
+    "-User", opt.user,
+    "-Project", opt.project,
+    "-Reads", opt.reads,
+    "-Apply",
+  ], { stdio: ["ignore", "inherit", "inherit"] });
+  if (r.status !== 0) {
+    die(`error: apply-denies.ps1 exited ${r.status} — ACLs may be inconsistent; not launching the child`, 90);
+  }
+  log(`reads mode "${opt.reads}" applied in ${Math.round((Date.now() - t) / 1000)}s`);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +361,7 @@ async function runSelftest() {
   const ps = join(opt.stage, "selftest.ps1").replace(/\\/g, "\\\\");
   const proj = opt.project.replace(/\\/g, "/").replace(/"/g, "");
   const deny = denyDir.replace(/\\/g, "/").replace(/"/g, "");
-  const cmd = `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${ps}" -Project "${proj}" -DenyDir "${deny}" -HostUser "${hostUser}"`;
+  const cmd = `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${ps}" -Project "${proj}" -DenyDir "${deny}" -HostUser "${hostUser}" -ReadsMode ${opt.reads}`;
   const { code, outBuf } = await runRemote(cmd, "selftest");
   console.log(code === 0 ? "SELFTEST=PASS" : `SELFTEST=FAIL (exit ${code})`);
   void outBuf;
@@ -353,6 +425,7 @@ if (opt.setup) {
   process.exit(code);
 }
 stage();
+applyReadsMode();
 if (opt.selftest) {
   const rc = await runSelftest();
   process.exit(rc === 0 ? 0 : 90);

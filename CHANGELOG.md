@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.9.1 — 2026-10-16
+
+**Dual reads mode for the dedicated-user variant** (`scripts/user/`) — plus
+a child `.gitconfig` escape fix.
+
+- `--reads deny|allow` flag (default `deny`). `deny` seals reads outside
+  the project (full denies on every sibling subtree of the project's
+  parent + foreign drive-root entries). `allow` keeps the write
+  confinement identical but drops the sibling denies, so the child can read
+  (and, per the default ACLs, write) elsewhere — e.g. to consult a
+  reference repo or docs. Outside writes are sealed the same way in both
+  modes.
+- `scripts/user/apply-denies.ps1` — new standalone, mode-independent ACL
+  switcher: cleans every `agent` ACE on the project's drive zone, then
+  re-applies the matrix for the requested mode. Idempotent, per-step
+  progress log, `skip=true` when the zone is already clean.
+- Mode auto-detect: the hypervisor probes one sibling with a single
+  `icacls` call before every run and skips the full re-apply (measured
+  ~6 min on a ~200-sibling tree) when the tree is already in the requested
+  mode. Detection recognises both new `F` denies and legacy `N`
+  (NO_ACCESS) denies.
+- `selftest.ps1` is mode-aware: in `allow` the sibling read/write probes
+  must *succeed*, in `deny` both must be blocked. Both matrices
+  live-verified 11/11 on the real tree (Box2D_Editor project).
+- Fix: `runner.mjs` wrote the raw Windows path (backslashes) into the
+  child's `.gitconfig` `safe.directory` — backslash is an escape character
+  in git config values, so every child git call died with "fatal: bad
+  config line 2" (the selftest's throwaway config used slashes, which
+  masked it). Paths are now slash-normalized.
+
+## v0.9.0 — 2026-10-16
+
 ## v0.9.0 — 2026-10-16
 
 **Dedicated-user variant (`scripts/user/`) — the child runs as a confined
