@@ -151,7 +151,7 @@ Options:
   --idle-timeout <sec>  No-events timeout while the model is thinking (default 300)
   --tool-timeout <sec>  No-events timeout while one tool call is running
                         (long builds are normal; default 1800)
-  --timeout <min>       Hard wall clock for the whole job (default: 240)
+  --timeout <min>       Hard wall clock for the whole job (default: 240; 0 = no wall clock / unlimited)
   --finalize <min>      Finalization window at the hard timeout (default 10;
                         0=off): at the wall clock the supervisor does not die
                         — it prompts "STOP new work, write the final report
@@ -520,7 +520,7 @@ writeFileSync(progressLogPath, "");
 const plog = (s) => { try { appendFileSync(progressLogPath, s); } catch { /* best effort */ } };
 plog(
   `[start] ${new Date().toISOString()} task=${task.length}chars ` +
-    `hard=${Math.round(hardTimeoutMs / 60000)}min session=${sessionId || "?"} ` +
+    `hard=${hardTimeoutMs > 0 ? Math.round(hardTimeoutMs / 60000) + "min" : "none"} session=${sessionId || "?"} ` +
     `consult=${consult ? "on" : "off"}\n`
 );
 
@@ -546,6 +546,7 @@ function fillTemplate(tpl, vars) {
 }
 
 function computeDeadline() {
+  if (hardTimeoutMs <= 0) { deadlineLocal = ""; deadlineIso = ""; return; } // 0 = unlimited
   const d = new Date(startTs + hardTimeoutMs);
   deadlineLocal = d.toLocaleString("en-CA", { hour12: false });
   deadlineIso = d.toISOString();
@@ -816,7 +817,7 @@ try {
   logSup(
     `[supervisor] loop-threshold=${loopThreshold} max-steers=${maxSteers} max-forks=${maxForks} ` +
       `idle=${Math.round(idleTimeoutMs / 1000)}s tool=${Math.round(toolTimeoutMs / 1000)}s ` +
-      `hard=${Math.round(hardTimeoutMs / 60000)}min`
+      `hard=${hardTimeoutMs > 0 ? Math.round(hardTimeoutMs / 60000) + "min" : "none"}`
   );
   logSup(
     `[supervisor] task: ${task.length} chars — "${task.slice(0, 160).replace(/\s+/g, " ")}${task.length > 160 ? "…" : ""}"`
@@ -905,16 +906,19 @@ try {
     // can be killed mid-item with no report. State the deadline in the first
     // prompt so the child can pace itself (and the finalization window, when
     // enabled, becomes meaningful).
-    const deadlineNote =
-      `\n\n[supervisor] HARD DEADLINE: the wall clock for this run ends at ${deadlineLocal} ` +
-      `(${deadlineIso} UTC; ${Math.round(hardTimeoutMs / 60000)} minutes from start).` +
-      (finalizeMin > 0
-        ? ` After that you get one final chance to write your final report, then the process is force-killed.`
-        : ` The process is force-killed at that point with no chance to report.`) +
-      ` Plan to finish the task — and any required report files — before the deadline.`;
+    const deadlineNote = hardTimeoutMs > 0
+      ? `\n\n[supervisor] HARD DEADLINE: the wall clock for this run ends at ${deadlineLocal} ` +
+        `(${deadlineIso} UTC; ${Math.round(hardTimeoutMs / 60000)} minutes from start).` +
+        (finalizeMin > 0
+          ? ` After that you get one final chance to write your final report, then the process is force-killed.`
+          : ` The process is force-killed at that point with no chance to report.`) +
+        ` Plan to finish the task — and any required report files — before the deadline.`
+      : ""; // --timeout 0 = unlimited: there is no wall clock to pace against
     const disp0 = await client.prompt(task + deadlineNote);
     logSup(`[supervisor] prompt disposition=${disp0}`);
-    logSup(`[supervisor] hard deadline: ${deadlineLocal} (${deadlineIso} UTC)` + (finalizeMin > 0 ? ` + ${finalizeMin}min finalization window` : ""));
+    if (hardTimeoutMs > 0) {
+      logSup(`[supervisor] hard deadline: ${deadlineLocal} (${deadlineIso} UTC)` + (finalizeMin > 0 ? ` + ${finalizeMin}min finalization window` : ""));
+    }
     checkpointId = await findCheckpoint();
     if (!checkpointId) {
       logSup("[supervisor] WARN: no checkpoint entry found; L2 forks will retry in place");
@@ -1057,7 +1061,7 @@ try {
         }
         continue;
       }
-      if (now - startTs > hardTimeoutMs) {
+      if (hardTimeoutMs > 0 && now - startTs > hardTimeoutMs) {
         if (finalizeMin > 0) {
           finalized = true;
           finalizeDeadlineMs = now + finalizeMin * 60000;

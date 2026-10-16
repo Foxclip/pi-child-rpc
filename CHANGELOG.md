@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.10.1 — 2026-10-16
+
+- `--timeout 0` now means **no wall clock (unlimited)** in `supervisor.mjs`.
+  Previously `0` hit the `elapsed > hardTimeoutMs` check on the very first
+  loop tick (effectively "die immediately") and there was no off-switch for
+  the deadline note. With `--timeout 0` the child gets no deadline note, the
+  90% budget warning never fires, and the manifest omits `deadline`.
+  Regression test added (`--timeout 0 = unlimited (completes, no wall
+  clock)`); suite 22 → 23 tests.
+- **Preflight latency probe ported to the remaining variants** — the
+  16-token timed completion (logs tok/s + SLOW warning, `--skip-latency`)
+  previously shipped only in `user/hypervisor.mjs`; it now runs in
+  `integrity/hypervisor.mjs` (against `--model-base-url`) and
+  `docker/hypervisor.mjs` (against the host-side URL — the forwarder — so the
+  measured path is the one the container's requests also traverse).
+
 ## v0.10.0 — 2026-10-16
 
 **Deadline-aware runs + host-side recovery** (supervisor/runner) and

@@ -121,7 +121,7 @@ node <skill_dir>/scripts/supervisor.mjs "Refactor module X to use Y; verify with
 
 - **Persists the session by default** (auto `--session-id sup-<timestamp>`, `--name` = the ID) so runs stay resumable. Every L2 fork creates a NEW session file — the RESULT line reports the **final** session (`sessionId`/`sessionFile`); resume THAT file with `rpc-child.mjs --session <file>` to continue or debug. `--no-session` for throwaway.
 - RESULT JSON: `{status: "completed"|"stuck"|"consult", exitReason: completed|completed-finalized|hard-timeout|stuck-loop|stuck-idle|aborted-external|degenerate-settle|missing-expected-file|stuck-stagnation|consult-loop|consult-stall|consult-external-abort|consult-error-loop|consult-heartbeat|consult-text-loop|consult-stagnation, task (≤200 chars) + taskChars, attempts, interventions: {steers, forks, loopsSeen}, sessionId, sessionFile, finalText (≤4000 chars) + finalTextTruncated, settle: {attemptTextChars, attemptToolCalls, lastMessageTextChars, errorStreakAtEnd}, expectedFiles (when given), progressLog, elapsedMs, recentToolCalls (last 15: {tool, args, isError, result≤300, durationMs, noContent?}), deadline (ISO), finalized (when the timeout was absorbed by the finalization window), manifest (path), consultFile/trigger/allowedActions (status=consult only)}`. The same summary is also written as a `[result]` line in the progress log, and the same payload + `cwd/provider/model/startedAt/finishedAt` is **always written to `pi-child-result.json` in the working directory** (the `manifest` field) — a stable small file the parent reads instead of digging the RESULT line out of a multi-hundred-KB log. Exit codes: 0 completed (incl. `completed-finalized`), 3 stuck, **4 consult** (waiting on the parent's resume), 1 error, 2 usage (including an unknown `--flag`).
-- Tuning: `--loop-threshold` (default **4** — one below the guard's default abort=5 so the steer lands first), `--max-steers`, `--max-forks`, `--idle-timeout`, `--tool-timeout`, `--timeout <min>` (hard wall clock, default 240), `--finalize <min>` (finalization window at the wall clock, default 10, 0=off), `--expect-file <path>` (repeatable), `--keep-delegate-tool`, sensors (`--max-errors`, `--heartbeat`, `--max-text`, `--stagnation`), steering (`--consult`, `--consult-file`, `--action`, `--message`, `--steer-msg`, `--fork-note`), plus all harness session/model flags (`--provider`, `--model`, `--session-id`, `--session`, `--session-dir`, `--name`).
+- Tuning: `--loop-threshold` (default **4** — one below the guard's default abort=5 so the steer lands first), `--max-steers`, `--max-forks`, `--idle-timeout`, `--tool-timeout`, `--timeout <min>` (hard wall clock, default 240; `0` = no wall clock / unlimited), `--finalize <min>` (finalization window at the wall clock, default 10, 0=off), `--expect-file <path>` (repeatable), `--keep-delegate-tool`, sensors (`--max-errors`, `--heartbeat`, `--max-text`, `--stagnation`), steering (`--consult`, `--consult-file`, `--action`, `--message`, `--steer-msg`, `--fork-note`), plus all harness session/model flags (`--provider`, `--model`, `--session-id`, `--session`, `--session-dir`, `--name`).
 - If you run with a custom `repetitionGuard` config, set `--loop-threshold` one below its `abort` value so L1 always wins the race.
 
 ### Task authoring (what a good long task contains)
@@ -154,7 +154,7 @@ Field lessons from real long runs — including a 240-minute run on a ~0.5 tok/s
 
 **Preflight (host side, before launch — cheap checks the child cannot do for you):**
 - Verify every external package/model/credential the task references *by name* (`npm view <pkg> version`, endpoint model list). A 2026-10-16 run lost 30+ minutes to discovering that 4 of 6 candidate package names were 404s on npm.
-- Measure the model: the user-variant hypervisor now runs a preflight latency probe and logs tok/s. Then budget: Σ(per-item timebox) ≤ `--timeout`. A run where N items × T min > the hard timeout is mathematically doomed before launch — reduce N, raise `--timeout`, or split the run.
+- Measure the model: the hypervisors all run a preflight latency probe and log tok/s (`--skip-latency` to skip). Then budget: Σ(per-item timebox) ≤ `--timeout`. A run where N items × T min > the hard timeout is mathematically doomed before launch — reduce N, raise `--timeout`, or split the run.
 - Verify the child's toolchain deps (ffmpeg, venvs, writable temp dirs — see child-environment gotchas below).
 
 **Task contract (beyond the authoring rules above):**
@@ -247,6 +247,7 @@ Hypervisor-only:
 | `--forward-to <h:p>` | `127.0.0.1:8080` | host target the forwarder pipes to |
 | `--no-forward` | off | skip the forwarder (model already reachable from the container) |
 | `--skip-health` | off | skip model health checks (e.g. model lives in the container) |
+| `--skip-latency` | off | skip the preflight latency probe (timed 16-token completion; logs tok/s — probes the host-side URL, i.e. the forwarder path the container also traverses) |
 | `--restarts <n>` | `1` | container restarts on infrastructure failure |
 | `--no-progress <sec>` | `2700` | kill+restart after this much total silence in the progress log; `0` disables. Must exceed the supervisor's `--tool-timeout` — a single long tool call is legitimate silence |
 | `--keep-container` | off | do not `--rm` the container on exit |
@@ -364,6 +365,7 @@ the downgrade itself fails.
 | `--context-window <n>` | context window written into the child's models.json | 262144 |
 | `--task <t>` / positional | task text | required |
 | `--selftest` | run the isolation selftest and exit | off |
+| `--skip-latency` | skip the preflight latency probe (timed 16-token completion; logs tok/s) | off |
 | `--log <file>` | log file name (in the workdir) | `pi-child-hypervisor.log` |
 
 **Windows-development note:** the child keeps the host's full native

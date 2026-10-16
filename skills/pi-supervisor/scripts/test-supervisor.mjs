@@ -392,7 +392,26 @@ run({
   }
 }
 
-// 15. reads-probe parsing (the 2026-10-16 regression: an ANCESTOR-INHERITED
+// 15. --timeout 0 = unlimited (no wall clock): the run must NOT be cut by a
+//     wall clock — with the pre-v0.10.1 semantics (--timeout 0 = "die now",
+//     since elapsed > 0 on the first tick) this run would hard-timeout;
+//     now it completes normally. No deadline note, no budget warning either.
+run({
+  name: "--timeout 0 = unlimited (completes, no wall clock)",
+  args: [TASK, "--timeout", "0"],
+  phases: [
+    // phase 0 = the task prompt's response: 2.5s of silence (LONGER than the
+    // pre-v0.10.1 die-now tick — elapsed > 0 fired on the first loop tick when
+    // --timeout 0) — then normal work + settle. Must all fit in one phase: the
+    // supervisor prompts only once, and steer/fork prompts consume later ones.
+    [{ pauseMs: 2500 }, ...tool("bash", { cmd: "ls" }), ...done("Done, report saved.")],
+  ],
+  expect: ["\"status\":\"completed\""],
+  expectNot: ["HARD TIMEOUT", "BUDGET WARNING", "HARD DEADLINE", "\"exitReason\":\"hard-timeout\""],
+  expectExit: 0,
+});
+
+// 16. reads-probe parsing (the 2026-10-16 regression: an ANCESTOR-INHERITED
 //     agent deny must not count as mode state — the clean can never remove
 //     inherited ACEs, so counting them triggered a re-apply that failed)
 {

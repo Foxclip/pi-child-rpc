@@ -52,6 +52,7 @@
 //   --forward-to <h:p>     Host target the forwarder pipes to (default 127.0.0.1:8080)
 //   --no-forward           Skip the forwarder (model already reachable from container)
 //   --skip-health          Skip model health checks (e.g. model lives IN the container)
+//   --skip-latency         Skip the preflight latency probe (tok/s measurement)
 //   --restarts <n>         Container restarts on infrastructure failure (default 1)
 //   --no-progress <sec>    Kill + restart after this much total silence in the
 //                          progress log (default 2700; 0 disables). Must exceed the
@@ -98,6 +99,7 @@ Hypervisor options:
   --forward-to <h:p>     Forwarder host target (default 127.0.0.1:8080)
   --no-forward           Skip the forwarder
   --skip-health          Skip model health checks
+  --skip-latency         Skip the preflight latency probe (tok/s measurement)
   --restarts <n>         Container restarts on infra failure (default 1)
   --no-progress <sec>    Silence window before kill+restart (default 2700, 0=off)
   --keep-container       Keep the container after exit
@@ -121,7 +123,7 @@ const HY_VALUE = new Set([
   "--no-progress", "--log",
 ]);
 const HY_BOOL = new Set([
-  "--no-forward", "--skip-health", "--keep-container", "-h", "--help",
+  "--no-forward", "--skip-health", "--skip-latency", "--keep-container", "-h", "--help",
 ]);
 // Shared: hypervisor uses them for config/env AND passes them to the supervisor.
 const SHARED_VALUE = new Set(["--provider", "--model"]);
@@ -142,6 +144,7 @@ const opt = {
   forwardTo: "127.0.0.1:8080",
   noForward: false,
   skipHealth: false,
+  skipLatency: false,
   restarts: 1,
   noProgressSec: 2700,
   keepContainer: false,
@@ -199,6 +202,7 @@ for (let i = 0; i < argv.length; i++) {
     switch (a) {
       case "--no-forward": opt.noForward = true; break;
       case "--skip-health": opt.skipHealth = true; break;
+      case "--skip-latency": opt.skipLatency = true; break;
       case "--keep-container": opt.keepContainer = true; break;
     }
     continue;
@@ -307,6 +311,42 @@ async function modelHealth() {
   let ids = [];
   try { ids = ((JSON.parse(r.text).data) || []).map((m) => m.id); } catch { /* non-JSON */ }
   return { ok: true, url, ids };
+}
+
+// Preflight latency probe: one small timed completion (16 tokens) against the
+// HOST-side endpoint (the forwarder, i.e. what the container's requests also
+// traverse) to measure tok/s — the number the task budget (--timeout,
+// per-item timeboxes) must be sized from. Best-effort: any failure just logs
+// and the run continues.
+async function latencyProbe(baseUrl, model, timeoutMs = 180000) {
+  const b = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
+  const url = /\/v\d+$/.test(b) ? `${b}/chat/completions` : `${b}/v1/chat/completions`;
+  const t0 = Date.now();
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "Reply with the single word: ok" }],
+        max_tokens: 16,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await res.text().catch(() => "");
+    const ms = Date.now() - t0;
+    if (!res.ok) return { ok: false, reason: `HTTP ${res.status}`, ms };
+    let tokens = 0;
+    try { tokens = JSON.parse(text).usage?.completion_tokens ?? 0; } catch { /* non-JSON */ }
+    if (!tokens) tokens = 16;
+    return { ok: true, ms, tokens, tps: tokens / (ms / 1000) };
+  } catch (e) {
+    return {
+      ok: false,
+      reason: /abort|timeout/i.test(e.message ?? "") ? `no completion in ${Math.round(timeoutMs / 1000)}s` : e.message,
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +586,16 @@ async function main() {
       log(`WARNING model "${opt.model}" not in /v1/models yet — the router may load it on demand; continuing`);
     } else {
       log(`health ok: model "${opt.model}" present (${h.ids.length} models listed)`);
+    }
+  }
+
+  if (!opt.skipLatency) {
+    const lt = await latencyProbe(hostModelBaseUrl(), opt.model);
+    if (lt.ok) {
+      log(`latency probe: ${lt.tokens} tokens in ${(lt.ms / 1000).toFixed(1)}s (~${lt.tps.toFixed(1)} tok/s) — size --timeout and per-item timeboxes from this`);
+      if (lt.tps < 2) log("  SLOW — budget per-item timeboxes accordingly (long turns may hit endpoint timeouts)");
+    } else {
+      log(`latency probe: failed (${lt.reason}) — continuing without tok/s`);
     }
   }
 

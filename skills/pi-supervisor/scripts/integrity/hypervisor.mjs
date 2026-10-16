@@ -63,7 +63,8 @@ function die(msg, code) {
 // ---------------------------------------------------------------------------
 const RESERVABLE = new Set([
   "base", "workdir", "src", "reuse", "model", "provider", "model-base-url",
-  "api-key", "context-window", "task", "selftest", "log", "help", "h",
+  "api-key", "context-window", "task", "selftest", "log", "skip-latency",
+  "help", "h",
 ]);
 const opt = {
   base: process.env.USERPROFILE ? join(process.env.USERPROFILE, "pi-supervisor-sandbox") : join(process.cwd(), "pi-supervisor-sandbox"),
@@ -78,6 +79,7 @@ const opt = {
   task: "",
   selftest: false,
   log: "pi-child-hypervisor.log",
+  skipLatency: false,
 };
 const supArgs = [];
 let task = "";
@@ -97,6 +99,7 @@ options:
   --context-window <n>   (default 262144)
   --task <text>          task text (or first positional)
   --selftest             verify downgrade + isolation, then exit
+  --skip-latency         Skip the preflight latency probe (tok/s measurement)
   --log <file>           log file name (default pi-child-hypervisor.log in workdir)
   <task>                 positional task text
   everything else        passed through to supervisor.mjs (see its --help)
@@ -123,6 +126,7 @@ for (let i = 0; i < argv.length; i++) {
     // boolean-ish reserved flags
     if (name === "selftest") { opt.selftest = true; continue; }
     if (name === "reuse") { opt.reuse = true; continue; }
+    if (name === "skip-latency") { opt.skipLatency = true; continue; }
     die(`error: --${name} needs a value`, 2);
   }
   switch (name) {
@@ -266,6 +270,40 @@ async function modelHealth() {
   let ids = [];
   try { ids = ((JSON.parse(r.text).data) || []).map((m) => m.id); } catch { /* non-JSON */ }
   return { ok: true, url, ids };
+}
+
+// Preflight latency probe: one small timed completion (16 tokens) to measure
+// tok/s — the number the task budget (--timeout, per-item timeboxes) must be
+// sized from. Best-effort: any failure just logs and the run continues.
+async function latencyProbe(baseUrl, model, timeoutMs = 180000) {
+  const b = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
+  const url = /\/v\d+$/.test(b) ? `${b}/chat/completions` : `${b}/v1/chat/completions`;
+  const t0 = Date.now();
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "Reply with the single word: ok" }],
+        max_tokens: 16,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await res.text().catch(() => "");
+    const ms = Date.now() - t0;
+    if (!res.ok) return { ok: false, reason: `HTTP ${res.status}`, ms };
+    let tokens = 0;
+    try { tokens = JSON.parse(text).usage?.completion_tokens ?? 0; } catch { /* non-JSON */ }
+    if (!tokens) tokens = 16;
+    return { ok: true, ms, tokens, tps: tokens / (ms / 1000) };
+  } catch (e) {
+    return {
+      ok: false,
+      reason: /abort|timeout/i.test(e.message ?? "") ? `no completion in ${Math.round(timeoutMs / 1000)}s` : e.message,
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +475,16 @@ if (!health.ok) {
 log(`model healthy: ${health.url} ids=[${health.ids.join(", ")}]`);
 if (opt.model && !health.ids.includes(opt.model)) {
   log(`note: requested model id "${opt.model}" not in server model list [${health.ids.join(", ")}] — the child will get a model-not-found error if the id is wrong`);
+}
+
+if (!opt.skipLatency) {
+  const lt = await latencyProbe(opt.modelBaseUrl, opt.model);
+  if (lt.ok) {
+    log(`latency probe: ${lt.tokens} tokens in ${(lt.ms / 1000).toFixed(1)}s (~${lt.tps.toFixed(1)} tok/s) — size --timeout and per-item timeboxes from this`);
+    if (lt.tps < 2) log("  SLOW — budget per-item timeboxes accordingly (long turns may hit endpoint timeouts)");
+  } else {
+    log(`latency probe: failed (${lt.reason}) — continuing without tok/s`);
+  }
 }
 
 const code = await runLowTree();
