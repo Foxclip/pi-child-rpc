@@ -1,5 +1,69 @@
 # Changelog
 
+## v0.10.0 — 2026-10-16
+
+**Deadline-aware runs + host-side recovery** (supervisor/runner) and
+**preflight latency** (user variant) — everything learned from a 240-minute
+run on a ~0.5 tok/s local model that was killed mid-probe with no report.
+
+### supervisor.mjs
+- `--finalize <min>` (default **10**, `0` = old behavior): the hard timeout
+  no longer kills the run. The supervisor prompts "STOP new work, write the
+  final report NOW" and waits up to N minutes for a settle (ladder
+  suppressed). A settle with a report → `exitReason=completed-finalized`
+  (status `completed`, exit 0); nothing usable → `hard-timeout` (exit 3).
+  The hard deadline is injected into the initial prompt, and a BUDGET WARNING
+  ("do not start new work items") is sent at 90% of the budget.
+- `--stagnation <n>` (default 0=off): sensor for N consecutive tool calls
+  that returned *no usable content* (empty / killed / timeout / HTTP 4xx-5xx
+  / permission denied) — calls that SUCCEED with useless output, which
+  `--max-errors` never sees. Autonomous: steer once, then fork per budget;
+  consult: parks (trigger `stagnation`). No-content calls are marked in
+  `recentToolCalls` (`noContent: true`).
+- **Run manifest**: the full RESULT payload + `cwd/provider/model/
+  startedAt/finishedAt` is always written to `pi-child-result.json` in the
+  working directory (RESULT gains a `manifest` field, plus `deadline` and
+  `finalized`) — the host reads one small file instead of digging the RESULT
+  line out of a multi-hundred-KB log.
+
+### user/runner.mjs
+- **Artifact export on any exit**: the child's full final message
+  (`pi-child-final.txt`; `RESULT.finalText` is truncated to 4000 chars) and
+  the **profile delta** (`pi-child-profile-delta.txt` — packages the child
+  installed/removed in its persistent profile), both into the project dir,
+  plus a best-effort copy of manifest + both into `<stage>\runs\`.
+  Leftover-state visibility without the host ever touching the (locked)
+  agent profile.
+
+### user/hypervisor.mjs + reads-probe.mjs
+- **Preflight latency probe**: after the health check, one small timed
+  completion (16 tokens) against the endpoint; logs tok/s with a SLOW warning
+  (<2 tok/s) — the number to size `--timeout` and per-item timeboxes by.
+  `--skip-latency` to skip; non-fatal on failure.
+- The reads-mode probe moved into `scripts/user/reads-probe.mjs` (shared CLI
+  `node reads-probe.mjs <user> <dir>`) and is now unit-tested: ancestor-
+  *inherited* agent ACEs are not mode state (a clean can never remove them,
+  so counting them forced a re-apply that failed on the same ACEs — the
+  die-90-on-every-launch bug of 2026-10-16, fixed live this session).
+
+### SKILL.md
+- New **Multi-hour run playbook (host side)**: preflight checklist (verify
+  package names by name, measure the model, budget Σ per-item time ≤
+  `--timeout`), incremental-artifact task contract, monitoring (manifest /
+  heartbeat), compression hygiene, child-environment gotchas (PS 5.1
+  `Set-Location`, `%TEMP%` staging → redirect `TMP`, llama.cpp `parallel=1`
+  request queueing), post-run leftover checks.
+- Task authoring: budget-awareness item updated (the supervisor now injects
+  the deadline), new incremental-artifacts rule. Sensor/flag/RESULT docs
+  updated for `--finalize`, `--stagnation`, the manifest, and the user
+  variant's latency probe + run artifacts.
+
+### Tests
+- `test-supervisor.mjs`: 10 → **22 tests** (stagnation sensor,
+  finalize → `completed-finalized`, finalize-0 legacy path, manifest file +
+  fields, 7 reads-probe parse cases incl. the inherited-deny regression).
+  User-variant selftest re-verified 11/11 on the real tree.
+
 ## v0.9.1 — 2026-10-16
 
 **Dual reads mode for the dedicated-user variant** (`scripts/user/`) — plus

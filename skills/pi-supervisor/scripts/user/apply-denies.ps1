@@ -72,7 +72,13 @@ function OwnerOf([string]$path) {
 # exits 0 (silent no-op) - verified empirically, which is what silently
 # doubled stale ACEs earlier.
 function AgentAces([string]$p) {
-  return (& icacls $p 2>&1 | Select-String -Pattern ($User + ':') | Out-String)
+  # NOTE: ignore INHERITED agent ACEs (lines like agent:(I)(OI)(CI)(N)).
+  # They are effective via inheritance from an out-of-scope ancestor (e.g. the
+  # legacy tier-1 NO_ACCESS deny on C:\Users\Suburban) and cannot be removed
+  # with icacls /remove (which only touches the object's own DACL). Only the
+  # object's explicit ACEs are in this script's management scope.
+  $inherited = $User + r':\(I\)'
+  return (& icacls $p 2>&1 | Select-String -Pattern ($User + ':') | Where-Object { $_ -notmatch $inherited } | Out-String)
 }
 function CleanPath([string]$p, [string]$tag) {
   IcaclsRun @($p, '/remove:g', $User) ($tag + "-allow") | Out-Null

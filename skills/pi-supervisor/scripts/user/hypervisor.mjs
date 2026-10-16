@@ -54,13 +54,14 @@
 // Exit codes: supervisor's own (0 completed, 1 infrastructure, 2 usage,
 // 3 stuck, 4 consult), 90 = setup/health failure, 91 = ssh spawn failure.
 
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, statSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
+import { detectReadsMode } from "./reads-probe.mjs";
 
 const SCRIPTS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const USER_DIR = join(SCRIPTS_DIR, "user");
@@ -77,7 +78,7 @@ function die(msg, code) {
 const RESERVABLE = new Set([
   "user", "key", "project", "model", "provider", "model-base-url", "api-key",
   "context-window", "task", "selftest", "setup", "stage", "skip-health",
-  "log", "host", "reads", "help", "h",
+  "skip-latency", "log", "host", "reads", "help", "h",
 ]);
 const opt = {
   user: "agent",
@@ -94,6 +95,7 @@ const opt = {
   setup: false,
   stage: "C:\\ProgramData\\pi-supervisor",
   skipHealth: false,
+  skipLatency: false,
   log: "pi-child-hypervisor.log",
   reads: "deny",
 };
@@ -119,6 +121,8 @@ options:
   --setup                one-time: install pi for the account (npm i -g), then exit
   --selftest             verify confinement + toolchain as the account, then exit
   --skip-health          skip the model endpoint health check
+  --skip-latency         skip the preflight latency probe (one small timed
+                         completion; logs tok/s so you can size --timeout)
   --log <file>           log file name (default pi-child-hypervisor.log in project)
   --reads deny|allow     outside reads mode, applied idempotently via
                          apply-denies.ps1 before every run (skipped if the
@@ -158,6 +162,7 @@ for (let i = 0; i < argv.length; i++) {
     if (name === "selftest") { opt.selftest = true; continue; }
     if (name === "setup") { opt.setup = true; continue; }
     if (name === "skip-health") { opt.skipHealth = true; continue; }
+    if (name === "skip-latency") { opt.skipLatency = true; continue; }
     die(`error: --${name} needs a value`, 2);
   }
   switch (name) {
@@ -175,6 +180,7 @@ for (let i = 0; i < argv.length; i++) {
     case "setup": opt.setup = true; break;
     case "stage": opt.stage = resolve(v); break;
     case "skip-health": opt.skipHealth = true; break;
+    case "skip-latency": opt.skipLatency = true; break;
     case "log": opt.log = v; break;
     case "reads":
       if (v !== "deny" && v !== "allow") die(`error: --reads must be "deny" or "allow" (got "${v}")`, 2);
@@ -228,31 +234,11 @@ function stage() {
 // ---------------------------------------------------------------------------
 // Reads mode — apply-denies.ps1 (runs locally as the host user, idempotent)
 // ---------------------------------------------------------------------------
-function detectReadsMode() {
-  // Probe = the first sibling directory of the project (same pick as the
-  // selftest): full (OI)(CI)F agent deny => "deny"; no agent ACE =>
-  // "allow"; anything else (or unreadable) => "unknown" (force re-apply).
-  let sample = "";
-  try {
-    const parent = dirname(opt.project);
-    for (const n of readdirSync(parent)) {
-      if (n === basename(opt.project)) continue;
-      const p = join(parent, n);
-      try { if (statSync(p).isDirectory()) { sample = p; break; } } catch { /* gone */ }
-    }
-  } catch { /* fall through */ }
-  if (!sample) return "unknown";
-  let out = "";
-  try { out = execFileSync("icacls", [sample], { encoding: "utf8" }); } catch { return "unknown"; }
-  const agentLines = out.split(/\r?\n/).filter((l) => l.includes(opt.user + ":"));
-  if (agentLines.length === 0) return "allow";
-  // F = full-control deny, N = NO_ACCESS deny (the legacy tier-1 setup used N)
-  if (agentLines.some((l) => /\bF\b|\bN\b/.test(l))) return "deny";
-  return "unknown";
-}
-
+// NOTE: detectReadsMode() lives in reads-probe.mjs (shared with the CLI and
+// the unit tests). It classifies only EXPLICIT agent ACEs — INHERITED ones
+// (agent:(I)...) come from out-of-scope ancestors and are not mode state.
 function applyReadsMode() {
-  const cur = detectReadsMode();
+  const cur = detectReadsMode({ user: opt.user, project: opt.project });
   if (cur === opt.reads) {
     log(`reads mode already "${opt.reads}" (sibling probe) — skipping apply-denies.ps1`);
     return;
@@ -297,6 +283,41 @@ async function modelHealth() {
   let ids = [];
   try { ids = ((JSON.parse(r.text).data) || []).map((m) => m.id); } catch { /* non-JSON */ }
   return { ok: true, url, ids };
+}
+
+// Preflight latency probe: one small completion, timed. The endpoint can be
+// "healthy" (list models) while generating at 0.5 tok/s — that fact is only
+// visible after an hour of child work, and it re-scopes the task (fewer
+// candidates, bigger --timeout). Non-fatal: a probe failure just logs a note.
+async function latencyProbe(baseUrl, model, timeoutMs = 180000) {
+  const b = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
+  const url = /\/v\d+$/.test(b) ? `${b}/chat/completions` : `${b}/v1/chat/completions`;
+  const t0 = Date.now();
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "Reply with the single word: ok" }],
+        max_tokens: 16,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await res.text().catch(() => "");
+    const ms = Date.now() - t0;
+    if (!res.ok) return { ok: false, reason: `HTTP ${res.status}`, ms };
+    let tokens = 0;
+    try { tokens = JSON.parse(text).usage?.completion_tokens ?? 0; } catch { /* non-JSON */ }
+    if (!tokens) tokens = 16;
+    return { ok: true, ms, tokens, tps: tokens / (ms / 1000) };
+  } catch (e) {
+    return {
+      ok: false,
+      reason: /abort|timeout/i.test(e.message ?? "") ? `no completion in ${Math.round(timeoutMs / 1000)}s` : e.message,
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +459,17 @@ if (!opt.skipHealth) {
   log(`model healthy: ${health.url} ids=[${health.ids.join(", ")}]`);
   if (opt.model && !health.ids.includes(opt.model)) {
     log(`note: requested model id "${opt.model}" not in server model list [${health.ids.join(", ")}] — the child will get a model-not-found error if the id is wrong`);
+  }
+  if (!opt.skipLatency) {
+    const lat = await latencyProbe(opt.modelBaseUrl, opt.model);
+    if (lat.ok) {
+      log(
+        `model latency: ${lat.tokens} tokens in ${(lat.ms / 1000).toFixed(1)}s (${lat.tps.toFixed(2)} tok/s)` +
+        (lat.tps < 2 ? " — SLOW model: size per-item timeboxes and --timeout accordingly" : "")
+      );
+    } else {
+      log(`note: latency probe failed (${lat.reason}) — non-fatal`);
+    }
   }
 }
 

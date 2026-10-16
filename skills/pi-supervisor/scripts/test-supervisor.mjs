@@ -22,13 +22,15 @@
 //     { "pauseMs": 1500 }            → silence (for stall tests)
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseIcaclsMode } from "./user/reads-probe.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const supervisorPath = join(here, "supervisor.mjs");
+const TASK = "task with enough length to pass the short-task warning threshold for tests";
 
 // ---------------------------------------------------------------------------
 // Fake pi package (PI_PACKAGE_DIR override)
@@ -174,7 +176,7 @@ function run({ name, args = [], phases, expect, expectExit = 0, expectNot = [] }
     console.log("--- output (last 40 lines) ---");
     console.log(out.split("\n").slice(-40).join("\n"));
   }
-  return out;
+  return { out, dir, code };
 }
 
 // tool start+end pair helper
@@ -311,6 +313,110 @@ run({
   expect: ["L1 text-loop steer", "thinking loop", "\"status\":\"completed\""],
   expectNot: ["L2 fork"],
 });
+
+// 11. Stagnation sensor: N consecutive SUCCESSFUL calls with no usable
+//     content (killed client / HTTP 400 / permission denied) → L1 steer
+//     (the failure shape --max-errors never sees: those calls do not fail)
+run({
+  name: "stagnation sensor → L1 steer → recovery",
+  args: [TASK, "--stagnation", "3", "--max-errors", "0"],
+  phases: [
+    [
+      { msg: [{ toolCall: "bash", args: { cmd: "probe1" } }] },
+      { toolEnd: { durationMs: 5, result: "killed at 270s (no output)" } },
+      { msg: [{ toolCall: "bash", args: { cmd: "probe2" } }] },
+      { toolEnd: { durationMs: 5, result: "400 Failed to load image or audio file (HTTP 400)" } },
+      { msg: [{ toolCall: "bash", args: { cmd: "probe3" } }] },
+      { toolEnd: { durationMs: 5, result: "Permission denied" } },
+    ],
+    [...tool("bash", { cmd: "next" }), ...done("Switched approach; report saved.")],
+  ],
+  expect: ["L1 stagnation steer", "3 consecutive tool calls returned no usable content", "\"status\":\"completed\""],
+  expectNot: ["L2 fork"],
+});
+
+// 12. Hard timeout WITH finalization: budget warning at 90%, finalize prompt at
+//     the wall clock, child settles with a report → completed-finalized, exit 0
+run({
+  name: "hard timeout → finalization window → completed-finalized",
+  args: [TASK, "--timeout", "0.15", "--finalize", "0.5"],
+  phases: [
+    [{ pauseMs: 7000 }], // task run (silence; idle-timeout is 300s, no stall)
+    [{ pauseMs: 1500 }], // budget-warning prompt (90% of 9s = 8.1s) — child silent
+    [
+      say("FINAL REPORT: partial — items 1-2 done, item 3 unfinished (out of time)."),
+      { writeFile: "report.md" },
+      { settled: {} },
+    ],
+  ],
+  expect: [
+    "BUDGET WARNING",
+    "HARD TIMEOUT",
+    "finalization window",
+    "\"status\":\"completed\"",
+    "\"exitReason\":\"completed-finalized\"",
+  ],
+  expectExit: 0,
+});
+
+// 13. Hard timeout with --finalize 0 (legacy behavior) → immediate hard-timeout
+run({
+  name: "hard timeout, --finalize 0 → immediate hard-timeout",
+  args: [TASK, "--timeout", "0.1", "--finalize", "0"],
+  phases: [
+    [{ pauseMs: 12000 }],
+  ],
+  expect: ["\"exitReason\":\"hard-timeout\"", "\"status\":\"stuck\""],
+  expectNot: ["finalization window", "BUDGET WARNING"],
+  expectExit: 3,
+});
+
+// 14. Run manifest: pi-child-result.json in the cwd (always, every outcome)
+{
+  const r = run({
+    name: "manifest written (pi-child-result.json)",
+    args: [TASK],
+    phases: [[...tool("bash", { cmd: "ls" }), ...done("All done, report saved.")]],
+    expect: ["\"status\":\"completed\""],
+  });
+  const mf = join(r.dir, "pi-child-result.json");
+  let m = null;
+  try { m = JSON.parse(readFileSync(mf, "utf8")); } catch { /* missing/invalid */ }
+  const okm = !!m && m.v === 1 && m.result?.status === "completed" &&
+    typeof m.result?.manifest === "string" && m.result.manifest.endsWith("pi-child-result.json") &&
+    typeof m.startedAt === "string" && typeof m.finishedAt === "string";
+  if (okm) { passCount++; console.log("PASS: manifest fields"); }
+  else {
+    failCount++;
+    console.log(`FAIL: manifest fields (exists=${existsSync(mf)} m=${JSON.stringify(m)?.slice(0, 200)})`);
+  }
+}
+
+// 15. reads-probe parsing (the 2026-10-16 regression: an ANCESTOR-INHERITED
+//     agent deny must not count as mode state — the clean can never remove
+//     inherited ACEs, so counting them triggered a re-apply that failed)
+{
+  const cases = [
+    ["inherited NO_ACCESS only → allow", parseIcaclsMode(
+      `sibling DESKTOP-N9PF8BH\\agent:(I)(OI)(CI)(N)\nBUILTIN\\Administrators:(OI)(CI)(F)`, "agent"), "allow"],
+    ["no agent ACE → allow", parseIcaclsMode(
+      `sibling BUILTIN\\Administrators:(OI)(CI)(F)\nCREATOR OWNER:(OI)(CI)(F)`, "agent"), "allow"],
+    ["explicit F deny → deny", parseIcaclsMode(
+      `sibling DESKTOP-X\\agent:(OI)(CI)(F)`, "agent"), "deny"],
+    ["explicit N deny (legacy) → deny", parseIcaclsMode(
+      `sibling DESKTOP-X\\agent:(OI)(CI)(N)`, "agent"), "deny"],
+    ["grant only → unknown", parseIcaclsMode(
+      `sibling DESKTOP-X\\agent:(OI)(CI)(M)`, "agent"), "unknown"],
+    ["legacy DENY-mask → unknown (safe: forces re-apply)", parseIcaclsMode(
+      `sibling DESKTOP-X\\agent:(DENY)(D,WO,WD,AD,DC,WA)`, "agent"), "unknown"],
+    ["inherited N + explicit grant → unknown (inherited ignored)", parseIcaclsMode(
+      `sibling DESKTOP-X\\agent:(I)(OI)(CI)(N)\nDESKTOP-X\\agent:(OI)(CI)(M)`, "agent"), "unknown"],
+  ];
+  for (const [name, got, want] of cases) {
+    if (got === want) { passCount++; console.log(`PASS: ${name}`); }
+    else { failCount++; console.log(`FAIL: ${name} (got ${got}, want ${want})`); }
+  }
+}
 
 console.log(`\n=== ${passCount} passed, ${failCount} failed ===`);
 process.exit(failCount === 0 ? 0 : 1);

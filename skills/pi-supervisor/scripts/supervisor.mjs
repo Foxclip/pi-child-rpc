@@ -35,12 +35,17 @@
 //   Budgets, attempt count and the hard wall clock carry across resumes.
 //
 //   Sensors beyond loop/stall/external-abort — in consult mode any of them
-//   PARKS the run (exit 4); in autonomous mode "error-loop" and "text-loop"
-//   run the normal ladder (steer once, then fork), while "heartbeat" stays
-//   consult-only (it is a parent-review mechanism, not a failure condition):
+//   PARKS the run (exit 4); in autonomous mode "error-loop", "text-loop" and
+//   "stagnation" run the normal ladder (steer once, then fork), while
+//   "heartbeat" stays consult-only (it is a parent-review mechanism, not a
+//   failure condition):
 //     - "error-loop"  --max-errors <n>  (default 6, 0=off): N consecutive
 //       FAILING tool calls (any tools/args) — the child is thrashing, even
 //       though the calls are not byte-identical
+//     - "stagnation"  --stagnation <n>  (default 0=off): N consecutive tool
+//       calls whose results carry NO usable content (empty, "killed",
+//       "timed out", HTTP 4xx/5xx, permission denied) — calls that SUCCEED
+//       (exit 0) with useless output, which "error-loop" never sees
 //     - "heartbeat"   --heartbeat <n>   (default 0=off): after every N
 //       completed tool calls — periodic parent review of progress. The payload
 //       carries the recent tool trace (args + results + errors + last text)
@@ -63,7 +68,13 @@
 //   - Stalls (no events at all): --idle-timeout while the model is thinking,
 //     --tool-timeout while one tool call is running → straight to L2 (a steer
 //     cannot reach a hung LLM call).
-//   - --timeout is the hard wall clock; L3 when it expires.
+//   - --timeout is the hard wall clock. With --finalize <min> (default 10,
+//     0=off) the expiry does NOT kill the run: the supervisor prompts
+//     "stop new work, write the final report now" and waits up to N minutes
+//     for a settle (the ladder is suppressed) → exitReason=
+//     completed-finalized (exit 0) when a report lands, hard-timeout
+//     (exit 3) otherwise. The deadline is injected into the initial prompt,
+//     and a BUDGET WARNING is sent at 90% of the budget.
 //   - Degenerate settle: a turn that ends WITHOUT reporting (no text at all —
 //     thinking-only or empty stop — or a <200-char stub with zero tool
 //     activity on the initial attempt) is NOT "completed": one corrective
@@ -88,7 +99,11 @@
 //     (<=200 chars) + taskChars, attempts, interventions, sessionId,
 //     sessionFile, finalText (<=4000 chars) + finalTextTruncated, settle
 //     {textChars, toolCallsTotal, errorStreakAtEnd}, expectedFiles,
-//     progressLog, elapsedMs, recentToolCalls. Diagnostics on stderr.
+//     progressLog, elapsedMs, recentToolCalls, deadline (ISO), finalized
+//     (set when the hard timeout was absorbed by the finalization window),
+//     manifest. The same payload + cwd/provider/model/startedAt/finishedAt is
+//     ALWAYS written to pi-child-result.json in the cwd (field `manifest`).
+//     Diagnostics on stderr.
 //   - Exit codes: 0 completed, 3 stuck, 4 consult (waiting on the parent
 //     session to resume), 1 error, 2 usage.
 
@@ -128,10 +143,23 @@ Options:
   --max-text <n>        Consult sensor: an assistant message longer than N
                         characters without a tool call triggers a consult
                         (default 20000; 0 disables)
+  --stagnation <n>      Sensor (both modes): N consecutive tool calls that
+                        returned NO usable content — empty output, "killed",
+                        "timed out", HTTP 4xx/5xx, permission denied. Catches
+                        calls that SUCCEED with useless output, which
+                        --max-errors never sees (default 0=off)
   --idle-timeout <sec>  No-events timeout while the model is thinking (default 300)
   --tool-timeout <sec>  No-events timeout while one tool call is running
                         (long builds are normal; default 1800)
   --timeout <min>       Hard wall clock for the whole job (default: 240)
+  --finalize <min>      Finalization window at the hard timeout (default 10;
+                        0=off): at the wall clock the supervisor does not die
+                        — it prompts "STOP new work, write the final report
+                        now" and waits up to N minutes for a settle. A settle
+                        with a report → exitReason=completed-finalized (exit
+                        0); nothing usable → hard-timeout (exit 3). The hard
+                        deadline is injected into the initial prompt, and a
+                        BUDGET WARNING is sent at 90% of the budget.
   --progress-log <p>    Path of the compact progress log — ALWAYS written,
                         one line per completed tool call (default
                         pi-child-progress.log in the cwd). Poll this file,
@@ -176,9 +204,11 @@ let resumeMessage = "";
 let maxErrors = 6;
 let heartbeatN = 0;
 let maxTextLen = 20000;
+let stagnationN = 0;
 let idleTimeoutMs = 300 * 1000;
 let toolTimeoutMs = 1800 * 1000;
 let hardTimeoutMs = 240 * 60 * 1000;
+let finalizeMin = 10;
 let keepQuestionTool = false;
 let keepDelegateTool = false;
 let progressLogArg = "";
@@ -190,8 +220,9 @@ const VALID_FLAGS = [
   "--name", "--provider", "--model", "--loop-threshold", "--max-steers",
   "--max-forks", "--steer-msg", "--fork-note", "--consult", "--consult-file",
   "--action", "--message", "--max-errors", "--heartbeat", "--max-text",
-  "--idle-timeout", "--tool-timeout", "--timeout", "--progress-log",
-  "--expect-file", "--preamble", "--keep-question-tool", "--keep-delegate-tool",
+  "--idle-timeout", "--tool-timeout", "--timeout", "--finalize", "--stagnation",
+  "--progress-log", "--expect-file", "--preamble", "--keep-question-tool",
+  "--keep-delegate-tool",
   "-h", "--help",
 ];
 
@@ -217,9 +248,11 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--max-errors") maxErrors = Number(argv[++i]);
   else if (a === "--heartbeat") heartbeatN = Number(argv[++i]);
   else if (a === "--max-text") maxTextLen = Number(argv[++i]);
+  else if (a === "--stagnation") stagnationN = Number(argv[++i]);
   else if (a === "--idle-timeout") idleTimeoutMs = Number(argv[++i]) * 1000;
   else if (a === "--tool-timeout") toolTimeoutMs = Number(argv[++i]) * 1000;
   else if (a === "--timeout") hardTimeoutMs = Number(argv[++i]) * 60 * 1000;
+  else if (a === "--finalize") finalizeMin = Number(argv[++i]);
   else if (a === "--progress-log") progressLogArg = argv[++i];
   else if (a === "--expect-file") expectFiles.push(argv[++i]);
   else if (a === "--preamble") preamble = argv[++i];
@@ -325,6 +358,8 @@ for (const [flag, value] of [
   ["--idle-timeout", idleTimeoutMs],
   ["--tool-timeout", toolTimeoutMs],
   ["--timeout", hardTimeoutMs],
+  ["--finalize", finalizeMin],
+  ["--stagnation", stagnationN],
 ]) {
   if (value === undefined || Number.isNaN(value)) {
     console.error(`error: ${flag} requires a (numeric) value`);
@@ -465,6 +500,12 @@ let attemptTextChars = 0;      // chars of streamed assistant text since the las
 let attemptToolCalls = 0;      // tool calls started since the last prompt
 let steersThisAttempt = 0;     // steers delivered in the current attempt
 let sensorHold = null;         // autonomous sensor already fired; re-arms on next tool result
+let noContentStreak = 0;       // consecutive no-content tool results (--stagnation)
+let finalized = false;         // inside the finalization window at the hard timeout
+let finalizeDeadlineMs = 0;    // end of the finalization window
+let budgetWarned = false;      // the 90%-of-budget warning was sent
+let deadlineLocal = "";        // local-time rendering of the hard deadline
+let deadlineIso = "";
 function resetAttemptCounters() {
   attemptTextChars = 0;
   attemptToolCalls = 0;
@@ -487,8 +528,27 @@ function logSup(msg) {
   process.stderr.write(msg + "\n");
 }
 
+// A tool result that carries no usable content: empty, or the shapes of
+// failure a probe-heavy environment produces (killed client, timeout, HTTP
+// 4xx/5xx from the endpoint, permission errors). Used by the --stagnation
+// sensor — these calls "succeed" (exit 0), so --max-errors never sees them.
+function isNoContent(res) {
+  const s = String(res ?? "").trim();
+  if (!s) return true;
+  if (/^(killed|killed at|no output|timed? ?out|timeout)/i.test(s)) return true;
+  if (/HTTP [45]\d{2}\b/i.test(s)) return true;
+  if (/\b(Permission|Access) denied\b/i.test(s)) return true;
+  return false;
+}
+
 function fillTemplate(tpl, vars) {
   return tpl.replace(/\{(\w+)\}/g, (m, k) => (vars[k] !== undefined ? String(vars[k]) : m));
+}
+
+function computeDeadline() {
+  const d = new Date(startTs + hardTimeoutMs);
+  deadlineLocal = d.toLocaleString("en-CA", { hour12: false });
+  deadlineIso = d.toISOString();
 }
 
 function consultAllowed(trigger) {
@@ -497,7 +557,8 @@ function consultAllowed(trigger) {
   // not for stall/external-abort, where a steer cannot reach a hung turn.
   if (
     (trigger === "loop" || trigger === "error-loop" || trigger === "heartbeat" ||
-      trigger === "text-loop" || trigger === "degenerate-settle" ||
+      trigger === "text-loop" || trigger === "stagnation" ||
+      trigger === "degenerate-settle" ||
       trigger === "missing-expected-file") && steersUsed < maxSteers
   ) acts.push("steer");
   if (forksUsed < maxForks) acts.push("fork");
@@ -582,6 +643,9 @@ function handleEvent(ev) {
       const rawRes = typeof ev.result === "string" ? ev.result : JSON.stringify(ev.result ?? "");
       c.result = rawRes.slice(0, 300);
       errorStreak = c.isError ? errorStreak + 1 : 0;
+      const noContent = isNoContent(rawRes);
+      noContentStreak = noContent ? noContentStreak + 1 : 0;
+      if (noContent) c.noContent = true;
       toolsSinceCheckpoint++;
       recentCalls.push(c);
       if (recentCalls.length > 15) recentCalls.shift();
@@ -779,6 +843,7 @@ try {
 
   startTs = Date.now();
   lastEventAt = startTs;
+  computeDeadline();
   if (resumePayload) {
     // Resume from a consult file: budgets, attempt count and the hard wall
     // clock come from the file, not from flags, so they carry across resumes.
@@ -790,6 +855,7 @@ try {
     maxForks = resumePayload.maxForks ?? maxForks;
     startTs = resumePayload.startTs ?? startTs;
     hardTimeoutMs = resumePayload.hardTimeoutMs ?? hardTimeoutMs;
+    computeDeadline(); // startTs/hardTimeoutMs were restored from the file
     checkpointId = resumePayload.taskEntryId ?? null;
     lastEventAt = Date.now();
     resetAttemptCounters();
@@ -835,8 +901,20 @@ try {
     }
   } else {
     resetAttemptCounters();
-    const disp0 = await client.prompt(task);
+    // Deadline awareness: the child never knew its wall clock existed — a run
+    // can be killed mid-item with no report. State the deadline in the first
+    // prompt so the child can pace itself (and the finalization window, when
+    // enabled, becomes meaningful).
+    const deadlineNote =
+      `\n\n[supervisor] HARD DEADLINE: the wall clock for this run ends at ${deadlineLocal} ` +
+      `(${deadlineIso} UTC; ${Math.round(hardTimeoutMs / 60000)} minutes from start).` +
+      (finalizeMin > 0
+        ? ` After that you get one final chance to write your final report, then the process is force-killed.`
+        : ` The process is force-killed at that point with no chance to report.`) +
+      ` Plan to finish the task — and any required report files — before the deadline.`;
+    const disp0 = await client.prompt(task + deadlineNote);
     logSup(`[supervisor] prompt disposition=${disp0}`);
+    logSup(`[supervisor] hard deadline: ${deadlineLocal} (${deadlineIso} UTC)` + (finalizeMin > 0 ? ` + ${finalizeMin}min finalization window` : ""));
     checkpointId = await findCheckpoint();
     if (!checkpointId) {
       logSup("[supervisor] WARN: no checkpoint entry found; L2 forks will retry in place");
@@ -851,6 +929,33 @@ try {
       lastEventAt = now;
       if (ev.type === "agent_settled") {
         plog(`[settled] ${new Date().toISOString()} aborted=${ev.aborted ? "yes" : "no"}\n`);
+        if (finalized) {
+          // Finalization window: accept whatever settle comes (no steer/fork —
+          // the window is for writing the report, not for retries).
+          if (ev.aborted && !abortedByMe) {
+            outcome = "hard-timeout";
+            settled = true;
+            continue;
+          }
+          if (!ev.aborted) {
+            const si = await inspectSettle();
+            const missing = expectFiles.filter((f) => !existsSync(f));
+            const emptyStop = attemptTextChars === 0 && attemptToolCalls === 0;
+            const strayTail = si.textChars === 0 && si.thinkingChars > 0 && attemptTextChars < 200;
+            if (!emptyStop && !strayTail && missing.length === 0) {
+              outcome = "completed-finalized";
+              logSup("[supervisor] settled during the finalization window with a report — completed-finalized");
+            } else {
+              outcome = "hard-timeout";
+              logSup(
+                `[supervisor] finalization settle degenerate/missing (missing=${missing.join(",") || "none"}) — hard-timeout`
+              );
+            }
+            settled = true;
+            continue;
+          }
+          continue; // abortedByMe — should not happen in finalization; keep waiting
+        }
         if (ev.aborted) {
           if (!abortedByMe) {
             // External abort — most commonly the host repetition guard
@@ -930,9 +1035,58 @@ try {
       }
       handleEvent(ev);
     }
-    if (now - startTs > hardTimeoutMs) {
+    if (!finalized) {
+      // 90%-of-budget warning (only with finalization: it tells the child to
+      // start wrapping up for the finalization window). Not counted against
+      // the steer budget — it is a deadline notice, not a correction.
+      if (finalizeMin > 0 && !budgetWarned && hardTimeoutMs > 0 && now - startTs >= hardTimeoutMs * 0.9) {
+        budgetWarned = true;
+        const remainMin = Math.max(1, Math.round((hardTimeoutMs - (now - startTs)) / 60000));
+        const warnMsg =
+          `[supervisor] BUDGET WARNING: ~${remainMin} minutes remain until the hard deadline ` +
+          `(${deadlineLocal}). Do NOT start new work items. Finish the current item, then write ` +
+          `your final report and required files NOW (mark unfinished items clearly) so they can ` +
+          `be recovered even if the deadline hits.`;
+        logSup(`[supervisor] BUDGET WARNING sent at 90% of the budget`);
+        plog(`[budget] ${new Date().toISOString()} ~${remainMin}min remaining\n`);
+        try {
+          const disp = toolDepth > 0 ? await client.steer(warnMsg) : await client.prompt(warnMsg);
+          logSup(`[supervisor] budget-warning disposition=${disp}`);
+        } catch (e) {
+          logSup(`[supervisor] budget-warning warn: ${e.message}`);
+        }
+        continue;
+      }
+      if (now - startTs > hardTimeoutMs) {
+        if (finalizeMin > 0) {
+          finalized = true;
+          finalizeDeadlineMs = now + finalizeMin * 60000;
+          logSup(`[supervisor] HARD TIMEOUT at the wall clock — entering a ${finalizeMin}-minute finalization window (ladder suppressed)`);
+          plog(`[finalize] ${new Date().toISOString()} window=${finalizeMin}min\n`);
+          try {
+            const disp = await client.prompt(
+              `[supervisor] HARD DEADLINE REACHED — you have ${finalizeMin} minutes before the process ` +
+              `is force-killed. STOP all new work immediately. Write the final report NOW with the ` +
+              `partial results gathered so far (state explicitly what is done, what is unfinished ` +
+              `and why). This prompt runs after your current turn ends.`
+            );
+            logSup(`[supervisor] finalize prompt disposition=${disp}`);
+          } catch (e) {
+            logSup(`[supervisor] finalize prompt warn: ${e.message}`);
+          }
+          continue;
+        }
+        outcome = "hard-timeout";
+        break;
+      }
+    } else if (now >= finalizeDeadlineMs) {
       outcome = "hard-timeout";
       break;
+    } else {
+      // Inside the finalization window: the settle handler above advances the
+      // run; the loop/sensor/stall ladder is suppressed (a stall here is the
+      // child writing the report, not a failure).
+      continue;
     }
     if (pendingLoop) {
       if (consultMode && (steersUsed < maxSteers || forksUsed < maxForks)) {
@@ -961,6 +1115,8 @@ try {
       let sensor = null;
       if (maxErrors > 0 && errorStreak >= maxErrors) {
         sensor = { kind: "error-loop", detail: `${errorStreak} consecutive tool calls failed` };
+      } else if (stagnationN > 0 && noContentStreak >= stagnationN) {
+        sensor = { kind: "stagnation", detail: `${noContentStreak} consecutive tool calls returned no usable content (empty/killed/timeout/HTTP error/permission denied)` };
       } else if (consultMode && heartbeatN > 0 && toolsSinceCheckpoint >= heartbeatN) {
         sensor = { kind: "heartbeat", detail: `${toolsSinceCheckpoint} tool calls since the last checkpoint` };
       } else if (maxTextLen > 0 && textSinceTool >= maxTextLen) {
@@ -978,7 +1134,9 @@ try {
           loopsSeen++;
           const msg = sensor.kind === "error-loop"
             ? `[supervisor] ${sensor.detail}. Stop repeating the failing approach: change your method or verify an assumption, then continue. If it cannot work, say exactly where it is blocked.`
-            : `[supervisor] You have written ${textSinceTool} chars of text without taking a tool action. Stop narrating and take the next concrete action with a tool call.`;
+            : sensor.kind === "stagnation"
+              ? `[supervisor] ${sensor.detail}. Stop probing a path that returns nothing: change your method, and if this target cannot work in this environment, record the finding and move on to the next item.`
+              : `[supervisor] You have written ${textSinceTool} chars of text without taking a tool action. Stop narrating and take the next concrete action with a tool call.`;
           logSup(`[supervisor] L1 ${sensor.kind} steer #${steersUsed}/${maxSteers}: ${sensor.detail}`);
           const disp = await client.steer(msg);
           logSup(`[supervisor] ${sensor.kind} steer disposition=${disp}`);
@@ -1018,9 +1176,12 @@ try {
   if (!finalText) finalText = finalTextAcc.trim();
 
   const isConsult = outcome.startsWith("consult-");
+  const isCompleted = outcome === "completed" || outcome === "completed-finalized";
   const result = {
-    status: outcome === "completed" ? "completed" : isConsult ? "consult" : "stuck",
+    status: isCompleted ? "completed" : isConsult ? "consult" : "stuck",
     exitReason: outcome,
+    deadline: deadlineIso || undefined,
+    finalized: finalized || undefined,
     task: task.length > 200 ? task.slice(0, 200) + `…(+${task.length - 200} chars)` : task,
     taskChars: task.length,
     attempts: attempt,
@@ -1045,9 +1206,26 @@ try {
     result.trigger = consultOut.trigger;
     result.allowedActions = consultOut.allowedActions;
   }
-  plog(`[result] ${new Date().toISOString()} status=${result.status} exitReason=${outcome} attempts=${attempt}\n`);
+  // Run manifest: the same RESULT payload + run metadata, written to a stable
+  // file in the cwd so the parent (or a post-mortem) does not have to dig the
+  // RESULT line out of a multi-hundred-KB log.
+  const manifestPath = join(process.cwd(), "pi-child-result.json");
+  result.manifest = manifestPath;
+  try {
+    const manifest = {
+      v: 1,
+      cwd: process.cwd(),
+      provider,
+      model,
+      startedAt: new Date(startTs).toISOString(),
+      finishedAt: new Date().toISOString(),
+      result,
+    };
+    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  } catch { /* best effort — the stdout RESULT line still carries everything */ }
+  plog(`[result] ${new Date().toISOString()} status=${result.status} exitReason=${outcome} attempts=${attempt} manifest=${manifestPath}\n`);
   process.stdout.write(`\n=== RESULT === ${JSON.stringify(result)}\n`);
-  exitCode = outcome === "completed" ? 0 : isConsult ? 4 : 3;
+  exitCode = isCompleted ? 0 : isConsult ? 4 : 3;
 } catch (err) {
   logSup(`\n[error] ${err.message}`);
   exitCode = 1;
