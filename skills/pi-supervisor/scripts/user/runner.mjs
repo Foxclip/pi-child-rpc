@@ -64,6 +64,11 @@ const models = {
         reasoning: false,
         contextWindow,
         maxTokens: contextWindow,
+        // Input modalities the host requested for the child (e.g. ["text","image"]).
+        // Without an explicit declaration pi uses its built-in default — on a
+        // text-only default the child CANNOT be fed images even when the server
+        // supports them, and nothing warns about it.
+        ...(Array.isArray(spec.input) && spec.input.length > 0 ? { input: spec.input } : {}),
       }],
     },
   },
@@ -228,8 +233,71 @@ function exportArtifacts() {
 }
 
 // ---------------------------------------------------------------------------
+// Child environment capture (host-readable, written BEFORE the run)
+//
+// The mirror image of exportArtifacts(): the host user cannot read the
+// account profile (DACL by design), so the runner records the child-side
+// facts the host can never see — pi install path/version, ffmpeg presence,
+// TEMP, node version, and what is installed in the account's package dirs
+// (including orphans that `pi list` does not show) — plus the input
+// modalities the host requested (spec.input). The host reads the file shortly
+// after launch to verify the environment the child actually got.
+// ---------------------------------------------------------------------------
+function writeChildEnv() {
+  const out = {
+    v: 1,
+    at: new Date().toISOString(),
+    user: process.env.USERNAME || null,
+    home: process.env.USERPROFILE || null,
+    cwd: spec.project,
+    tmp: process.env.TEMP || process.env.TMP || null,
+    node: process.version,
+    pi: null,
+    ffmpeg: null,
+    installedPackages: [],
+    model: {
+      provider: spec.provider,
+      id: spec.model,
+      baseUrl: spec.baseUrl,
+      input: Array.isArray(spec.input) ? spec.input : null, // null = pi's default declaration
+    },
+  };
+  try {
+    const where = execFileSync("where", ["pi.cmd"], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim().split(/\r?\n/)[0];
+    if (where && existsSync(where)) {
+      out.pi = { path: where };
+      try {
+        out.pi.version = execFileSync(where, ["--version"], {
+          encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 15000,
+        }).trim();
+      } catch { /* non-fatal */ }
+    }
+  } catch { /* pi not on PATH — recorded as null */ }
+  try {
+    const ff = execFileSync("where", ["ffmpeg"], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim().split(/\r?\n/)[0];
+    if (ff && existsSync(ff)) out.ffmpeg = ff;
+  } catch { /* no ffmpeg */ }
+  try {
+    const root = execFileSync("npm", ["root", "-g", "--silent"], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (root) out.installedPackages = readdirSync(root).filter((n) => !n.startsWith(".")).sort();
+  } catch { /* npm unavailable */ }
+  const p = join(spec.project, ".pi-child-env.json");
+  try {
+    writeFileSync(p, JSON.stringify(out, null, 2));
+    console.error(`[runner] child env captured -> ${p}`);
+  } catch { /* best effort */ }
+}
+
+// ---------------------------------------------------------------------------
 // Exec the supervisor (cwd = project, stdio inherited so the host sees it live)
 // ---------------------------------------------------------------------------
+writeChildEnv();
 profBefore = profileSnapshot();
 const child = spawn(process.execPath, [SUPERVISOR, ...supArgs], {
   cwd: spec.project,

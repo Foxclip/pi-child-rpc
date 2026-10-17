@@ -113,6 +113,8 @@ For **one long autonomous job** (one task, many turns, runs unattended), use `sc
 - **Deadline awareness and finalization** (v0.10.0): the child is told the hard deadline in the initial prompt (`[supervisor] HARD DEADLINE: ...`), a `BUDGET WARNING` is sent at 90% of the budget ("do not start new work items; write your final report now"), and the wall-clock expiry does NOT kill the run while `--finalize <min>` is enabled (default **10**, `0` = the old immediate kill): the supervisor enters a **finalization window** — one prompt ("STOP all new work, write the final report NOW"), up to N minutes waiting for a settle with the ladder suppressed. A settle with a report → `exitReason=completed-finalized` (status `completed`, exit 0); nothing usable → `hard-timeout` (exit 3). This turns a hard timeout from "no artifact" into "partial report" — a 4-hour run killed mid-probe was recovered in ~5 minutes instead of ~1 hour of forensics.
 - **Parent-authored ladder messages** (no consult needed): `--steer-msg "<text>"` and `--fork-note "<text>"` fully replace the built-in L1/L2 messages (variables `{tool}`, `{count}` / `{reason}`). Use for task-specific guidance — the parent wrote the task, so it knows which failure modes to warn about (e.g. "the registry is blocked; use the local cache").
 - **Progress log, always on** (v0.4.0): `pi-child-progress.log` in the working directory is written in every mode — one line per completed tool call, plus `[start]`/`[settled]`/`[result]` summary lines. It is the cheap status surface for a parent that wants to peek without parsing a 20 MB session jsonl (see **Monitoring a long run**).
+- **Live status file, always on** (v0.11.0): `pi-child-status.json` in the working directory, rewritten on every completed tool call and every state transition (start/steer/fork/consult/result/error): `{status, exitReason, attempt, toolCalls, lastTool, lastToolStartedAt, elapsedMs, sessionId, sessionFile, expectedFiles}`. The machine-readable half of the progress log — a monitoring loop is one read + JSON.parse, and the `expectedFiles` map answers "is the artifact there yet?" without an `ls`.
+- **Task from a file** (`--task-file <path>`, v0.11.0): long tasks belong in a file — no shell quoting, no truncation. The whole file (BOM/whitespace-trimmed) becomes the task; mutually exclusive with a positional/`--task` task. A task that happens to be an existing file path (the classic "I passed the path, not the text" bug — it cost a 2026-10-17 run a wasted discovery step) now gets an explicit `did you mean --task-file?` warning.
 - **Strict CLI** (v0.4.0): an unknown `--flag` is an error (exit 2). Unknown flags used to be joined into the task text — a typo'd flag became the child's *entire* task. At startup the supervisor echoes the resolved task (`[supervisor] task: N chars — "..."`) and warns when it is suspiciously short (< 100 chars). `rpc-child.mjs` rejects unknown flags the same way.
 
 ```bash
@@ -125,6 +127,8 @@ node <skill_dir>/scripts/supervisor.mjs "Refactor module X to use Y; verify with
 - If you run with a custom `repetitionGuard` config, set `--loop-threshold` one below its `abort` value so L1 always wins the race.
 
 ### Task authoring (what a good long task contains)
+
+Start from `task-template.md` in this skill directory — a fill-in-the-blanks contract that encodes the rules below.
 
 A long autonomous task is a *contract*, not a suggestion. Every failure in this skill's history traced back to a missing piece of the contract:
 
@@ -154,6 +158,7 @@ Field lessons from real long runs — including a 240-minute run on a ~0.5 tok/s
 
 **Preflight (host side, before launch — cheap checks the child cannot do for you):**
 - Verify every external package/model/credential the task references *by name* (`npm view <pkg> version`, endpoint model list). A 2026-10-16 run lost 30+ minutes to discovering that 4 of 6 candidate package names were 404s on npm.
+- Declare vision if the task needs it (user variant, v0.11.0): `--model-input text,image` writes the modalities into the child's models.json. Without it pi's default declaration applies — a text-only default means the child CANNOT be fed images even when the server supports them, and nothing warns about it. Verify what landed in `.pi-child-env.json` (project dir, see After the run) shortly after launch.
 - Measure the model: the hypervisors all run a preflight latency probe and log tok/s (`--skip-latency` to skip). Then budget: Σ(per-item timebox) ≤ `--timeout`. A run where N items × T min > the hard timeout is mathematically doomed before launch — reduce N, raise `--timeout`, or split the run.
 - Verify the child's toolchain deps (ffmpeg, venvs, writable temp dirs — see child-environment gotchas below).
 
@@ -161,7 +166,7 @@ Field lessons from real long runs — including a 240-minute run on a ~0.5 tok/s
 - Incremental artifacts: one line per sub-item to a results file immediately (`--expect-file` for the final report).
 - Give the child an *environment-failure policy*: "if a tool returns no usable content three times in a row, record the finding and move on" (the `--stagnation` sensor steers it there if it doesn't).
 
-**Monitoring:** end of run → `pi-child-result.json` (manifest); mid-run → progress log (non-identical polls); long runs → `--consult --heartbeat` (above).
+**Monitoring:** end of run → `pi-child-result.json` (manifest) + the expected artifacts; mid-run → `pi-child-status.json` (one small JSON, updated per tool call) and the progress log (non-identical polls); long runs → `--consult --heartbeat` (above).
 
 **Compression hygiene (ACP hosts):** when compressing conversation around a run, record the *exact* artifact paths (project dir, log files, report file) in the summary, verbatim. A paraphrased path cost an hour of artifact hunting in the 2026-10-16 post-mortem.
 
@@ -171,6 +176,7 @@ Field lessons from real long runs — including a 240-minute run on a ~0.5 tok/s
 - A `parallel=1` llama.cpp server *queues* a new request while a killed probe client's request is still generating — the next probe "hangs" for the rest of the queued generation. Drain/wait before the next probe.
 
 **After the run:**
+- Read `.pi-child-env.json` (project dir; written by the user-variant runner at launch, v0.11.0) — the host's window into the child-side environment the profile DACLs hide: pi path/version, ffmpeg, TEMP, node, installed packages (including orphans `pi list` does not show), and the model input modalities that were requested.
 - Check `pi-child-profile-delta.txt` (user variant) for packages the child installed into its persistent profile; clean leftovers before the next run (a 2026-10-16 run silently left two video extensions on the account profile).
 - `pi-child-final.txt` (user variant) holds the child's FULL final message (`RESULT.finalText` is truncated to 4000 chars).
 
@@ -534,6 +540,7 @@ freely — the host never needs to enter the agent profile (locked by design).
 | `--project <dir>` | the in-place project the child is granted | required (setup/selftest take it positionally) |
 | `--reads <mode>` | outside reads: `deny` (sealed) or `allow` (open; outside writes sealed either way) | `deny` |
 | `--model <id>` / `--provider <id>` | model id / provider id | `$PI_MODEL` / `localllama` |
+| `--model-input <csv>` | input modalities declared in the child's models.json (comma list from text,image,audio,video) | pi's default declaration |
 | `--model-base-url <u>` | model endpoint | `http://127.0.0.1:8080/v1` |
 | `--api-key <k>` | provider API key | `local` |
 | `--context-window <n>` | context window written into models.json | 262144 |

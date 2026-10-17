@@ -108,7 +108,7 @@
 //     session to resume), 1 error, 2 usage.
 
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -116,6 +116,10 @@ const USAGE = `Usage:
   node supervisor.mjs "autonomous task description" [options]
 Options:
   --task <t>            Task text (alternative to the positional argument)
+  --task-file <path>    Task text from a file (whole file, BOM/whitespace
+                        trimmed). Preferred for long tasks: no shell quoting,
+                        no truncation. Mutually exclusive with a
+                        positional/--task task.
   --session-id <id>     Persist under this exact ID (default: auto sup-<timestamp>)
   --no-session          Do not persist (throwaway run; fork retries happen in memory)
   --session <path|id>   Resume an existing session file or exact ID and run the
@@ -163,7 +167,11 @@ Options:
   --progress-log <p>    Path of the compact progress log — ALWAYS written,
                         one line per completed tool call (default
                         pi-child-progress.log in the cwd). Poll this file,
-                        not the session jsonl.
+                        not the session jsonl. A machine-readable snapshot
+                        is ALWAYS written alongside it as pi-child-status.json
+                        in the cwd (status, toolCalls, lastTool, elapsedMs,
+                        session id/file, expectedFiles) — one small JSON per
+                        tool call + state transition.
   --expect-file <path>  Completion artifact: on settle, if this file does not
                         exist the run is NOT "completed" — autonomous mode
                         settle-steers then forks per budget; consult mode
@@ -185,6 +193,7 @@ Resume from a consult file (instead of a task):
 const argv = process.argv.slice(2);
 const positional = [];
 let task = "";
+let taskFileArg = "";
 let sessionArg = "";
 let sessionRef = "";
 let noSession = false;
@@ -216,7 +225,7 @@ const expectFiles = [];
 let preamble = "";
 
 const VALID_FLAGS = [
-  "--task", "--session-id", "--session", "--no-session", "--session-dir",
+  "--task", "--task-file", "--session-id", "--session", "--no-session", "--session-dir",
   "--name", "--provider", "--model", "--loop-threshold", "--max-steers",
   "--max-forks", "--steer-msg", "--fork-note", "--consult", "--consult-file",
   "--action", "--message", "--max-errors", "--heartbeat", "--max-text",
@@ -229,6 +238,7 @@ const VALID_FLAGS = [
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === "--task") task = argv[++i];
+  else if (a === "--task-file") taskFileArg = argv[++i];
   else if (a === "--session-id") sessionArg = argv[++i];
   else if (a === "--session") sessionRef = argv[++i];
   else if (a === "--no-session") noSession = true;
@@ -274,7 +284,7 @@ for (let i = 0; i < argv.length; i++) {
 
 let resumePayload = null;
 if (consultFileArg) {
-  if (positional.length > 0 || task) {
+  if (positional.length > 0 || task || taskFileArg) {
     console.error("error: --consult-file resumes a run; do not pass a task argument");
     process.exit(2);
   }
@@ -314,6 +324,23 @@ if (consultFileArg) {
   task = resumePayload.task;
 }
 
+if (taskFileArg) {
+  if (positional.length > 0 || task) {
+    console.error("error: --task-file conflicts with a positional/--task task argument");
+    process.exit(2);
+  }
+  try {
+    task = readFileSync(taskFileArg, "utf8").replace(/^\uFEF/, "").trim();
+  } catch (e) {
+    console.error(`error: cannot read --task-file ${taskFileArg}: ${e.message}`);
+    process.exit(2);
+  }
+  if (!task) {
+    console.error(`error: --task-file ${taskFileArg} is empty`);
+    process.exit(2);
+  }
+}
+
 const prompts = positional.length > 0 ? positional : [task];
 if (!prompts.every((p) => p !== undefined && p !== "") || prompts.length === 0) {
   console.error("error: no task provided (check flag values) — a short/missing task usually means a misspelled flag or a dropped value");
@@ -327,6 +354,11 @@ if (!resumePayload && task.length < 100) {
     `[warn] task suspiciously short (${task.length} chars) — check your invocation; ` +
       `unknown --flags are rejected, so a short task usually means a misspelled flag or a dropped value\n`
   );
+  if (existsSync(task) && statSync(task).isFile()) {
+    process.stderr.write(
+      `[warn] the task text is an existing file path — did you mean --task-file ${task}?\n`
+    );
+  }
 }
 if (consult && !resumePayload && noSession) {
   console.error("error: --consult requires a persisted session (not --no-session)");
@@ -480,6 +512,8 @@ let loopCount = 0;
 let pendingLoop = null; // {toolName, count} — threshold hit, escalation queued
 let toolDepth = 0;
 let lastToolName = "";
+let lastToolStartedAt = 0; // ms timestamp of the most recent tool_execution_start
+let totalToolCalls = 0;    // completed tool calls across the whole run
 let lastEventAt = Date.now();
 let startTs = 0;
 let attempt = 1;
@@ -523,6 +557,32 @@ plog(
     `hard=${hardTimeoutMs > 0 ? Math.round(hardTimeoutMs / 60000) + "min" : "none"} session=${sessionId || "?"} ` +
     `consult=${consult ? "on" : "off"}\n`
 );
+
+// Live status file — the machine-readable half of the progress log. One
+// small JSON in the cwd, rewritten on every completed tool call and on every
+// state transition (start/steer/fork/consult/result/error). A monitoring
+// loop is one read + JSON.parse: no line matching, and the file always
+// reflects the current attempt (session id/file, tool count, elapsed).
+const statusFilePath = join(process.cwd(), "pi-child-status.json");
+function writeStatus(status, exitReason) {
+  try {
+    const payload = {
+      v: 1,
+      at: new Date().toISOString(),
+      status, // running | completed | stuck | consult | error
+      exitReason: exitReason || undefined,
+      attempt,
+      toolCalls: totalToolCalls,
+      lastTool: lastToolName || null,
+      lastToolStartedAt: lastToolStartedAt > 0 ? new Date(lastToolStartedAt).toISOString() : null,
+      elapsedMs: startTs > 0 ? Date.now() - startTs : 0,
+      sessionId: stateSessionId || null,
+      sessionFile: stateSessionFile || null,
+      expectedFiles: expectFiles.length > 0 ? Object.fromEntries(expectFiles.map((f) => [f, existsSync(f)])) : undefined,
+    };
+    writeFileSync(statusFilePath, JSON.stringify(payload, null, 2));
+  } catch { /* best effort */ }
+}
 
 function logSup(msg) {
   process.stderr.write(msg + "\n");
@@ -611,6 +671,7 @@ async function doConsult(trigger, extra) {
       `${payload.allowedActions.join("|")}. The child is being shut down orderly; ` +
       `the session persists — resume with --consult-file to steer.`
   );
+  writeStatus("consult", trigger);
 }
 
 function handleEvent(ev) {
@@ -624,7 +685,9 @@ function handleEvent(ev) {
     attemptToolCalls++;
     textSinceTool = 0;
     lastToolName = ev.toolName;
+    lastToolStartedAt = Date.now();
     logSup(`[child tool: ${ev.toolName}] ${JSON.stringify(ev.args ?? {}).slice(0, 200)}`);
+    writeStatus("running");
     openCalls.push({ tool: ev.toolName, args: JSON.stringify(ev.args ?? {}).slice(0, 300) });
     const sig = ev.toolName + "\x1f" + JSON.stringify(ev.args ?? {});
     if (sig === lastSig) loopCount++;
@@ -648,6 +711,7 @@ function handleEvent(ev) {
       noContentStreak = noContent ? noContentStreak + 1 : 0;
       if (noContent) c.noContent = true;
       toolsSinceCheckpoint++;
+      totalToolCalls++;
       recentCalls.push(c);
       if (recentCalls.length > 15) recentCalls.shift();
       sensorHold = null; // re-arm autonomous sensors after new tool activity
@@ -655,6 +719,7 @@ function handleEvent(ev) {
         `[tool] ${new Date().toISOString()} tools=${toolsSinceCheckpoint} ` +
           `${c.tool}${c.isError ? " ERR" : ""}${c.durationMs !== undefined ? " " + c.durationMs + "ms" : ""}\n`
       );
+      writeStatus("running");
     }
   } else if (ev.type === "extension_ui_request") {
     if (["select", "confirm", "input", "editor"].includes(ev.method)) {
@@ -697,6 +762,7 @@ async function doSteer(pl) {
   logSup(`[supervisor] L1 steer #${steersUsed}/${maxSteers}: loop on ${pl.toolName} x${pl.count}`);
   const disp = await client.steer(msg);
   logSup(`[supervisor] steer disposition=${disp}`);
+  writeStatus("running");
 }
 
 // L2: abort + fork(before the task message) + re-prompt. The fork creates a NEW
@@ -753,6 +819,7 @@ async function doFork(reason) {
   loopCount = 0;
   toolDepth = 0;
   lastEventAt = Date.now();
+  writeStatus("running");
 }
 
 // Settle quality. A healthy completion ends with a written report; a model
@@ -803,6 +870,7 @@ async function doDegenerateSteer(dReason, missing) {
   );
   const disp = await client.prompt(msg);
   logSup(`[supervisor] settle-steer disposition=${disp}`);
+  writeStatus("running");
 }
 
 let exitCode = 1;
@@ -824,6 +892,8 @@ try {
   );
   if (expectFiles.length > 0) logSup(`[supervisor] expected files: ${expectFiles.join(", ")}`);
   logSup(`[supervisor] progress log: ${progressLogPath}`);
+  logSup(`[supervisor] status file: ${statusFilePath}`);
+  writeStatus("running");
   if (loopThreshold >= 5) {
     logSup(
       "[supervisor] NOTE: threshold >= 5 means the host repetition guard " +
@@ -1215,6 +1285,7 @@ try {
   // RESULT line out of a multi-hundred-KB log.
   const manifestPath = join(process.cwd(), "pi-child-result.json");
   result.manifest = manifestPath;
+  result.statusFile = statusFilePath;
   try {
     const manifest = {
       v: 1,
@@ -1228,10 +1299,12 @@ try {
     writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
   } catch { /* best effort — the stdout RESULT line still carries everything */ }
   plog(`[result] ${new Date().toISOString()} status=${result.status} exitReason=${outcome} attempts=${attempt} manifest=${manifestPath}\n`);
+  writeStatus(result.status, outcome);
   process.stdout.write(`\n=== RESULT === ${JSON.stringify(result)}\n`);
   exitCode = isCompleted ? 0 : isConsult ? 4 : 3;
 } catch (err) {
   logSup(`\n[error] ${err.message}`);
+  writeStatus("error", err.message.slice(0, 300));
   exitCode = 1;
 } finally {
   await client.stop().catch(() => {});

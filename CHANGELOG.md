@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.11.0 — 2026-10-17
+
+**Monitoring + task-file + child-env visibility** — learned from the round-3
+video-extension run (53-min unlimited run, exit 0, report delivered) whose
+host-side monitoring was still hand-rolled: tailing the progress log, grepping
+for the report, and the child re-learning the environment the host cannot see.
+
+### supervisor.mjs
+- `--task-file <path>`: task text read from a file (whole file,
+  BOM/whitespace-trimmed). Preferred for long tasks — no shell quoting, no
+  truncation. Mutually exclusive with a positional/`--task` task. A task that
+  happens to be an existing file path (the classic "I passed the path instead
+  of the text" bug) now gets an explicit `did you mean --task-file?` warning
+  alongside the short-task warning.
+- **Live status file, always on**: `pi-child-status.json` in the cwd,
+  rewritten on every completed tool call and every state transition
+  (start/steer/fork/settle-steer/consult/result/error):
+  `{v, at, status, exitReason, attempt, toolCalls, lastTool,
+  lastToolStartedAt, elapsedMs, sessionId, sessionFile, expectedFiles}`.
+  The machine-readable half of the progress log — monitoring is one read +
+  JSON.parse, and the `expectedFiles` map answers "is the artifact there yet?"
+  without an `ls`. `RESULT.statusFile` names the file.
+
+### user variant
+- `--model-input <csv>` (comma list from text,image,audio,video): declared in
+  the child's models.json by the runner. Without it pi's default declaration
+  applies — on a text-only default the child CANNOT be fed images even when
+  the server supports them (the silent failure that cost a full round of the
+  2026-10-16/17 video-extension investigation).
+- **Child environment capture**: the runner writes `.pi-child-env.json` into
+  the project before spawn — the host-readable mirror of the profile the
+  profile-DACLs hide: pi path/version, ffmpeg, TEMP, node, installed packages
+  (including orphans `pi list` does not show), and the modalities the host
+  requested.
+
+### Tests + docs
+- test-supervisor.mjs 23 → 28 (task-file read/conflict/missing, path-as-task
+  hint, status-file content + expectedFiles).
+- SKILL.md: status-file + `--task-file` bullets, monitoring line, preflight
+  vision-declaration bullet, `.pi-child-env.json` after-run bullet,
+  user-variant flag table. New `task-template.md`: a fill-in-the-blanks task
+  contract encoding the Task-authoring rules + the field lessons.
+
 ## v0.10.1 — 2026-10-16
 
 - `--timeout 0` now means **no wall clock (unlimited)** in `supervisor.mjs`.

@@ -138,10 +138,11 @@ writeFileSync(join(fakePkg, "dist", "index.js"), FAKE_INDEX);
 let passCount = 0;
 let failCount = 0;
 
-function run({ name, args = [], phases, expect, expectExit = 0, expectNot = [] }) {
+function run({ name, args = [], phases, expect = [], expectExit = 0, expectNot = [], setup = null, assertFiles = [] }) {
   const dir = mkdtempSync(join(tmpdir(), "pi-sup-test-"));
   const specFile = join(dir, "script.json");
   writeFileSync(specFile, JSON.stringify({ phases }));
+  if (setup) setup(dir);
   // spawnSync (not execFileSync): [supervisor]/[info] lines go to STDERR and
   // must be included in the assertions.
   const r = spawnSync("node", [supervisorPath, ...args], {
@@ -160,10 +161,18 @@ function run({ name, args = [], phases, expect, expectExit = 0, expectNot = [] }
   });
   const code = r.status ?? 1;
   const out = ((r.stdout ?? "") + (r.stderr ?? "")).toString();
+  const fileProblems = [];
+  for (const f of assertFiles) {
+    let content;
+    try { content = readFileSync(join(dir, f.path), "utf8"); }
+    catch { fileProblems.push(`missing file: ${f.path}`); continue; }
+    for (const s of f.expect ?? []) if (!content.includes(s)) fileProblems.push(`${f.path} missing ${JSON.stringify(s)}`);
+  }
   const ok =
     code === expectExit &&
     expect.every((s) => out.includes(s)) &&
-    expectNot.every((s) => !out.includes(s));
+    expectNot.every((s) => !out.includes(s)) &&
+    fileProblems.length === 0;
   if (ok) {
     passCount++;
     console.log(`PASS: ${name}`);
@@ -173,6 +182,7 @@ function run({ name, args = [], phases, expect, expectExit = 0, expectNot = [] }
     console.log(`  exit=${code} (expected ${expectExit})`);
     for (const s of expect) if (!out.includes(s)) console.log(`  missing: ${JSON.stringify(s)}`);
     for (const s of expectNot) if (out.includes(s)) console.log(`  unexpected: ${JSON.stringify(s)}`);
+    for (const p of fileProblems) console.log(`  ${p}`);
     console.log("--- output (last 40 lines) ---");
     console.log(out.split("\n").slice(-40).join("\n"));
   }
@@ -436,6 +446,69 @@ run({
     else { failCount++; console.log(`FAIL: ${name} (got ${got}, want ${want})`); }
   }
 }
+
+// ---------------------------------------------------------------------------
+// v0.11.0: --task-file + live status file
+// ---------------------------------------------------------------------------
+run({
+  name: "--task-file: task read from file (sentinel echo + completed)",
+  args: ["--task-file", "taskfile.md"],
+  phases: [
+    [...tool("bash", { cmd: "ls" }), ...done("Done. All items processed; report written to report.md.")],
+  ],
+  setup: (dir) => writeFileSync(join(dir, "taskfile.md"), "SENTINEL_TASKFILE_ALPHA " + "x".repeat(120) + "\n"),
+  expect: ["SENTINEL_TASKFILE_ALPHA", "\"status\":\"completed\""],
+  expectExit: 0,
+});
+
+run({
+  name: "--task-file: conflicts with positional task",
+  args: ["task with enough length to pass the short-task warning threshold for tests", "--task-file", "x.md"],
+  phases: [],
+  expect: ["--task-file conflicts with a positional/--task task argument"],
+  expectExit: 2,
+});
+
+run({
+  name: "--task-file: unreadable path → usage error",
+  args: ["--task-file", "does-not-exist.md"],
+  phases: [],
+  expect: ["cannot read --task-file"],
+  expectExit: 2,
+});
+
+run({
+  name: "task text that is an existing file path → --task-file hint",
+  args: ["notes.md"],
+  phases: [
+    [...tool("bash", { cmd: "cat notes.md" }), ...done("Read notes.md: it says hello.")],
+  ],
+  setup: (dir) => writeFileSync(join(dir, "notes.md"), "hello\n"),
+  expect: ["suspiciously short", "did you mean --task-file notes.md"],
+  expectExit: 0,
+});
+
+run({
+  name: "status file: per-tool-call updates, final state, expectedFiles tracked",
+  args: [
+    "task with enough length to pass the short-task warning threshold for tests",
+    "--expect-file", "report.md",
+  ],
+  phases: [
+    [...tool("bash", { cmd: "ls" }), { writeFile: "report.md" }, ...done("Done. report written to report.md.")],
+  ],
+  expectExit: 0,
+  assertFiles: [{
+    path: "pi-child-status.json",
+    expect: [
+      '"status": "completed"',
+      '"exitReason": "completed"',
+      '"toolCalls": 1',
+      '"lastTool": "bash"',
+      '"report.md": true',
+    ],
+  }],
+});
 
 console.log(`\n=== ${passCount} passed, ${failCount} failed ===`);
 process.exit(failCount === 0 ? 0 : 1);

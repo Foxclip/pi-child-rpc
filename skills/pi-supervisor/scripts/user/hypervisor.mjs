@@ -76,7 +76,7 @@ function die(msg, code) {
 // CLI (strict; unknown --flags are passed to supervisor.mjs verbatim)
 // ---------------------------------------------------------------------------
 const RESERVABLE = new Set([
-  "user", "key", "project", "model", "provider", "model-base-url", "api-key",
+  "user", "key", "project", "model", "model-input", "provider", "model-base-url", "api-key",
   "context-window", "task", "selftest", "setup", "stage", "skip-health",
   "skip-latency", "log", "host", "reads", "help", "h",
 ]);
@@ -86,6 +86,7 @@ const opt = {
   host: "127.0.0.1",
   project: "",
   model: process.env.PI_MODEL || "",
+  modelInput: "", // comma list: text,image,audio,video (declared in the child's models.json)
   provider: "localllama", // fresh id: the child gets its own agent dir, so nothing collides
   modelBaseUrl: "http://127.0.0.1:8080/v1",
   apiKey: "local",
@@ -112,6 +113,11 @@ options:
   --host <addr>          ssh target (default 127.0.0.1 — loopback only)
   --project <dir>        working directory the child runs in (required for run)
   --model <id>           model id (default $PI_MODEL)
+  --model-input <csv>    input modalities declared in the child's models.json
+                         (comma list from text,image,audio,video). Without it
+                         pi's default declaration applies — on a text-only
+                         default the child CANNOT be fed images even when the
+                         server supports them (the classic silent failure).
   --provider <id>        provider id registered in the child's models.json (default "localllama")
   --model-base-url <u>   model endpoint (default http://127.0.0.1:8080/v1)
   --api-key <k>          (default "local")
@@ -171,6 +177,7 @@ for (let i = 0; i < argv.length; i++) {
     case "host": opt.host = v; break;
     case "project": opt.project = resolve(v); break;
     case "model": opt.model = v; break;
+    case "model-input": opt.modelInput = v; break;
     case "provider": opt.provider = v; break;
     case "model-base-url": opt.modelBaseUrl = v; break;
     case "api-key": opt.apiKey = v; break;
@@ -192,6 +199,15 @@ for (let i = 0; i < argv.length; i++) {
 if (opt.task) task = opt.task;
 if (!task && !opt.selftest && !opt.setup) { usage(); die("error: no task (positional or --task)", 2); }
 if (opt.contextWindow <= 0) die("error: --context-window must be > 0", 2);
+const MODEL_INPUTS = ["text", "image", "audio", "video"];
+let modelInputs = [];
+if (opt.modelInput) {
+  modelInputs = opt.modelInput.split(",").map((s) => s.trim()).filter(Boolean);
+  const bad = modelInputs.filter((m) => !MODEL_INPUTS.includes(m));
+  if (bad.length > 0) die(
+    `error: --model-input has unknown modalities: ${bad.join(", ")} (allowed: ${MODEL_INPUTS.join(", ")})`, 2
+  );
+}
 if (!opt.model && !opt.selftest && !opt.setup) die("error: no model — pass --model or set $PI_MODEL", 2);
 if (!opt.key && !opt.setup) die("error: --key <path> required (SSH private key for the dedicated account)", 2);
 if (opt.key && !existsSync(opt.key)) die(`error: --key not found: ${opt.key}`, 2);
@@ -401,12 +417,17 @@ async function runSupervisor() {
   const spec = Buffer.from(JSON.stringify({
     provider: opt.provider,
     model: opt.model,
+    input: modelInputs,
     baseUrl: opt.modelBaseUrl,
     apiKey: opt.apiKey,
     contextWindow: opt.contextWindow,
     project: opt.project,
     supArgs: supervisorArgs(),
   }), "utf8").toString("base64");
+  log(
+    `model input modalities: ${modelInputs.length > 0 ? "[" + modelInputs.join(", ") + "]" : `not declared (pi default for ${opt.model || "the model"})`} ` +
+      `— the child's effective config lands in .pi-child-env.json (project dir)`
+  );
   const runner = join(opt.stage, "runner.mjs").replace(/\\/g, "/");
   const cmd = `node ${runner} --spec ${spec}`;
   const { code, outBuf } = await runRemote(cmd, "supervisor");
