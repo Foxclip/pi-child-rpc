@@ -115,11 +115,11 @@ Hypervisor options:
 // Argument parsing (strict: unknown --flag is an error, like the rest of the skill)
 // ---------------------------------------------------------------------------
 const SUP_VALUE = new Set([
-  "--task", "--session-id", "--session", "--session-dir", "--name",
+  "--task", "--task-file", "--session-id", "--session", "--session-dir", "--name",
   "--loop-threshold", "--max-steers", "--max-forks", "--steer-msg", "--fork-note",
   "--consult-file", "--action", "--message", "--max-errors", "--heartbeat",
-  "--max-text", "--idle-timeout", "--tool-timeout", "--timeout",
-  "--progress-log", "--expect-file", "--preamble",
+  "--max-text", "--idle-timeout", "--tool-timeout", "--timeout", "--finalize",
+  "--stagnation", "--progress-log", "--expect-file", "--preamble",
 ]);
 const SUP_BOOL = new Set(["--no-session", "--consult", "--keep-question-tool", "--keep-delegate-tool"]);
 const HY_VALUE = new Set([
@@ -136,6 +136,7 @@ const SHARED_VALUE = new Set(["--provider", "--model"]);
 const argv = process.argv.slice(2);
 const supArgs = [];
 let task = "";
+let sawTaskFile = false;
 const opt = {
   image: "pi-supervisor:docker",
   docker: "docker",
@@ -184,7 +185,11 @@ for (let i = 0; i < argv.length; i++) {
     supArgs.push(a, v);
     continue;
   }
-  if (SUP_VALUE.has(a)) { supArgs.push(a, argv[++i] ?? die(`error: ${a} requires a value`, 2)); continue; }
+  if (SUP_VALUE.has(a)) {
+    if (a === "--task-file") sawTaskFile = true;
+    supArgs.push(a, argv[++i] ?? die(`error: ${a} requires a value`, 2));
+    continue;
+  }
   if (SUP_BOOL.has(a)) { supArgs.push(a); continue; }
   if (HY_VALUE.has(a)) {
     const v = argv[++i];
@@ -227,7 +232,7 @@ if (sawHelp) { console.log(USAGE); process.exit(0); }
 
 if (task && supArgs.includes("--task")) die("error: pass the task positionally OR via --task, not both", 2);
 const isResume = supArgs.includes("--consult-file");
-if (!task && !isResume) die(USAGE + "\n\nerror: a task is required (positionally or via --task)", 2);
+if (!task && !sawTaskFile && !isResume) die(USAGE + "\n\nerror: a task is required (positionally, via --task, or via --task-file)", 2);
 if (isResume && !supArgs.includes("--action")) die("error: --consult-file requires --action steer|fork|continue", 2);
 
 // Provider/model defaults + reserved-id guard.
