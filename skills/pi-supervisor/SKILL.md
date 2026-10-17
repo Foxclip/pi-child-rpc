@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use when a task needs a long-lived, isolated second pi — parallel work, a sub-conversation, or orchestrated follow-ups — that one-shot `pi --print` cannot cover. Also bundles supervisor.mjs for unattended long runs (loop/stall/degenerate-settle detection, steer/fork/stuck ladder, --expect-file completion artifacts, always-on progress log), a Docker 3-layer setup (scripts/docker/hypervisor.mjs) that runs supervisor and child in a container with the model on the host, a low-integrity sandbox variant (scripts/integrity/hypervisor.mjs) for admin-free native-Windows sandboxing via Mandatory Integrity Control (no Docker, no UAC prompt), and a dedicated-user variant (scripts/user/hypervisor.mjs) that runs the child as a confined local Windows account (real NTFS-ACL boundary, in-place project access) over loopback SSH.
+description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use when a task needs a long-lived, isolated second pi — parallel work, a sub-conversation, or orchestrated follow-ups — that one-shot `pi --print` cannot cover. Also bundles guard.mjs for unattended long runs (loop/stall/degenerate-settle detection, steer→rewind→fork→stuck ladder, --expect-file completion artifacts, always-on progress log), a Docker 3-layer setup (scripts/docker/hypervisor.mjs) that runs supervisor and child in a container with the model on the host, a low-integrity sandbox variant (scripts/integrity/hypervisor.mjs) for admin-free native-Windows sandboxing via Mandatory Integrity Control (no Docker, no UAC prompt), and a dedicated-user variant (scripts/user/hypervisor.mjs) that runs the child as a confined local Windows account (real NTFS-ACL boundary, in-place project access) over loopback SSH.
 ---
 
 # Interacting with a child pi process
@@ -12,7 +12,7 @@ A pi agent can spawn and converse with another pi agent. It is not limited to `a
 | One-shot task, final text is enough | Print mode | `pi --print "task"` (plain bash) |
 | One-shot, structured events | JSON mode | `pi --mode json "task"` |
 | Multi-turn, bidirectional | **RPC mode** | `scripts/rpc-child.mjs` in this skill, or a custom `RpcClient` script |
-| One long autonomous job, unattended | **Supervised RPC** | `scripts/supervisor.mjs` (loop/stall detection + steer→fork→stuck ladder) |
+| One long autonomous job, unattended | **Supervised RPC** | `scripts/guard.mjs` (loop/stall detection + steer→rewind→fork→stuck ladder) |
 | One long autonomous job, sandboxed in a container | **Docker 3-layer** | `scripts/docker/hypervisor.mjs` (host) → supervisor + child in the container |
 | One long autonomous job, sandboxed without Docker/admin | **Low-IL sandbox** | `scripts/integrity/hypervisor.mjs` (native Windows, no UAC prompt) |
 | One long autonomous job, confined real account, in-place project | **Dedicated user** | `scripts/user/hypervisor.mjs` (loopback SSH to a confined local Windows account) |
@@ -88,42 +88,43 @@ Mitigations:
 3. **Custom client with an idle-based timeout** — the built-in deadline is wall-clock from prompt send, so a legitimate long tool run plus a long generation can trip it even though nothing is wrong. In a custom `RpcClient` script, reset the deadline on every incoming event (text deltas, `tool_execution_start`/`update`, `bash_execution_update`): an actively working child keeps emitting events; only a genuinely hung child (e.g. stalled provider, unanswered dialog) goes silent.
 4. **Persist the child's session** for long jobs — pass `--session-id <id>` (plus `--name`) so a timed-out or aborted job can be *resumed* in a fresh child instead of restarted from scratch: same ID, same cwd, next turn continues the conversation (see **Session persistence and resuming**).
 
-## Supervised autonomous runs (supervisor.mjs)
+## Supervised autonomous runs (guard.mjs)
 
-For **one long autonomous job** (one task, many turns, runs unattended), use `scripts/supervisor.mjs` instead of one giant `--turn`. It runs the child and supervises it against the failure modes that kill long jobs:
+For **one long autonomous job** (one task, many turns, runs unattended), use `scripts/guard.mjs` instead of one giant `--turn`. It runs the child and supervises it against the failure modes that kill long jobs:
 
 - **Tool-call loops.** The ACP context layer (the `billion-context-pi` package) runs a `repetitionGuard` (issue #308; `acp.json` key `repetitionGuard`; defaults warn=3, abort=5, counter **per session**) that refuses the 5th consecutive byte-identical tool call and **aborts the turn**. The supervisor detects the loop itself — consecutive identical tool+args in `tool_execution_start` events — and escalates:
   1. **L1 steer** (default budget `--max-steers 3`): inject a corrective message via `steer()` — the programmatic "please continue, different approach".
-  2. **L2 fork+retry** (default budget `--max-forks 2`): abort + `fork(before the task message)` + re-prompt with a "that approach is exhausted" note. A fork is a **new session file** — loop history discarded, and the guard's per-session counter starts clean.
-  3. **L3 give up**: `RESULT status=stuck`, exit 3.
+  2. **L1.5 rewind** (default budget `--max-rewinds 1`, `0` = off): abort + fork before the task message + re-prompt the task with an anti-loop note (`--rewind-note` replaces it). The loop history is gone and the attempt restarts from a clean transcript — the first full reset, tried before spending a fork. (Mechanically a fork before the task, like L2; it occupies its own budget slot and fires only on tool loops — stalls and external aborts go straight to L2.)
+  3. **L2 fork+retry** (default budget `--max-forks 2`): abort + `fork(before the task message)` + re-prompt with a "that approach is exhausted" note. A fork is a **new session file** — loop history discarded, and the guard's per-session counter starts clean.
+  4. **L3 give up**: `RESULT status=stuck`, exit 3.
 - **Stalls** (no events at all): `--idle-timeout` (default 300 s while the model thinks) or `--tool-timeout` (default 1800 s while one tool call is running — long builds are normal) → straight to L2; a steer cannot reach a hung LLM call.
 - **External aborts** (the guard firing at 5, or any host-side abort of the turn) are treated as recoverable: straight to L2 while fork budget remains.
 - **Degenerate settles** (v0.4.0) — the model can end a turn *without acting*: thinking-only (no text, no tool call), empty text, or a settle right after an external abort with nothing produced in between. Before v0.4.0 these were reported as `completed` — a 3.8-hour run that spent its whole budget hunting a now-unrecoverable transcript secret, and a run whose task was a 27-char CLI artifact, both "completed" this way. Now the supervisor inspects every settle: a degenerate settle is handled like an external abort (corrective prompt on L1 budget → L2 fork → consult-park or `exitReason=degenerate-settle`, exit 3). A settle right after an external abort is degenerate only if the model produced nothing at all in between (a short, deliberate stop that follows an abort is a normal stop).
 - **Missing completion artifacts** (`--expect-file <path>`, repeatable, v0.4.0): the supervisor has no notion of "done" beyond "the model stopped talking". On any settle, a missing expected file is handled exactly like a degenerate settle (`exitReason=missing-expected-file`) — the supervisor does not declare success while a required artifact is absent.
 - **Consult mode** (`--consult`) — intelligent steering by the parent session: instead of firing L1/L2 with built-in messages, the supervisor **pauses at the intervention point**. It persists the session, writes `pi-child-consult.json` (trigger, loop stats, open + last 15 completed tool calls, last assistant text, budgets, session id/file) and exits **4** with `RESULT status=consult, consultFile=...`. The child is shut down orderly (in-flight turn aborted; completed side effects stay on disk). The parent then reads the payload and re-invokes:
   ```bash
-  node scripts/supervisor.mjs --consult-file pi-child-consult.json --action steer|fork|continue --message "your steering instruction"
+  node scripts/guard.mjs --consult-file pi-child-consult.json --action steer|fork|rewind|continue --message "your steering instruction"
   ```
-  `steer` = send your message into the same session, in place. `fork` = branch before the task message and re-prompt task + your message (new session file, fresh guard counter — like L2, but with your note). `continue` = resume with the built-in ladder for the rest of the run. Budgets, attempt count and the hard wall clock carry across resumes (they come from the consult file, not flags). The consult file is **overwritten at each intervention** — always resume the latest one. While the child is parked, it is not running: no CPU/model cost, but also no progress.
+  `steer` = send your message into the same session, in place. `fork` = branch before the task message and re-prompt task + your message (new session file, fresh guard counter — like L2, but with your note). `rewind` = the same operation as `fork` (branch before the task, re-prompt task + your message) but consumes the L1.5 rewind budget instead of the fork budget — choose it when the run was parked on a loop. `continue` = resume with the built-in ladder for the rest of the run. Budgets, attempt count and the hard wall clock carry across resumes (they come from the consult file, not flags). The consult file is **overwritten at each intervention** — always resume the latest one. While the child is parked, it is not running: no CPU/model cost, but also no progress.
 - **Extended sensors**. The built-in detectors cover *known* failure shapes; these widen the net. `error-loop`, `text-loop` and `stagnation` run in **both** modes: in consult mode a hit parks the run for the parent, in autonomous mode they run the normal ladder (steer once, then fork per budget). `heartbeat` is consult-only (parking for a parent review is meaningless unattended):
   - `error-loop` — `--max-errors <n>` (default **6**, 0 disables): N consecutive *failing* tool calls of any kind. Catches thrashing the identical-loop detector misses (different calls, all failing).
   - `heartbeat` — `--heartbeat <n>` (default 0 = off): after every N completed tool calls, the supervisor parks and hands you the trace for a progress review. The payload carries the recent tool calls (args, truncated results, errors, durations) plus the child's last text, so you can judge drift, wasted work, or anything a fixed detector cannot name. Each heartbeat = one parent turn + child restart (it re-reads its transcript), so keep N large.
   - `text-loop` — `--max-text <n>` (default **20000** chars, 0 disables): an assistant message longer than N characters *without a tool call*. This is the "thinking loop" — the model keeps appending words to the same message. It is invisible to every other sensor: the child emits text deltas continuously, so the stall detector sees a healthy, busy child, and there are no tool calls for the loop/error/heartbeat detectors to key on. Without this sensor, only the hard wall clock stops the run — and that is terminal (`stuck`, exit 3). In consult mode the payload's `lastAssistantText` shows you the ramble (steer or fork); in autonomous mode the ladder steers the child back on task, then forks per budget.
   - `stagnation` — `--stagnation <n>` (default **0 = off**): N consecutive tool calls that returned **no usable content** — empty output, `killed`, `timed out`, HTTP 4xx/5xx, permission denied. These calls *succeed* (exit 0), so `error-loop` never sees them; this is the shape probe-heavy tasks die in (a 2026-10-16 run made 124 calls, most returning "killed at 270 s" or HTTP 400, and no failure sensor ever fired). Marked calls carry `noContent: true` in `recentToolCalls`.
 - **Deadline awareness and finalization** (v0.10.0): the child is told the hard deadline in the initial prompt (`[supervisor] HARD DEADLINE: ...`), a `BUDGET WARNING` is sent at 90% of the budget ("do not start new work items; write your final report now"), and the wall-clock expiry does NOT kill the run while `--finalize <min>` is enabled (default **10**, `0` = the old immediate kill): the supervisor enters a **finalization window** — one prompt ("STOP all new work, write the final report NOW"), up to N minutes waiting for a settle with the ladder suppressed. A settle with a report → `exitReason=completed-finalized` (status `completed`, exit 0); nothing usable → `hard-timeout` (exit 3). This turns a hard timeout from "no artifact" into "partial report" — a 4-hour run killed mid-probe was recovered in ~5 minutes instead of ~1 hour of forensics.
-- **Parent-authored ladder messages** (no consult needed): `--steer-msg "<text>"` and `--fork-note "<text>"` fully replace the built-in L1/L2 messages (variables `{tool}`, `{count}` / `{reason}`). Use for task-specific guidance — the parent wrote the task, so it knows which failure modes to warn about (e.g. "the registry is blocked; use the local cache").
+- **Parent-authored ladder messages** (no consult needed): `--steer-msg "<text>"`, `--rewind-note "<text>"` and `--fork-note "<text>"` fully replace the built-in L1/L1.5/L2 messages (variables `{tool}`, `{count}` for L1; `{reason}` for L1.5/L2). Use for task-specific guidance — the parent wrote the task, so it knows which failure modes to warn about (e.g. "the registry is blocked; use the local cache").
 - **Progress log, always on** (v0.4.0): `pi-child-progress.log` in the working directory is written in every mode — one line per completed tool call, plus `[start]`/`[settled]`/`[result]` summary lines. It is the cheap status surface for a parent that wants to peek without parsing a 20 MB session jsonl (see **Monitoring a long run**).
 - **Live status file, always on** (v0.11.0): `pi-child-status.json` in the working directory, rewritten on every completed tool call and every state transition (start/steer/fork/consult/result/error): `{status, exitReason, attempt, toolCalls, lastTool, lastToolStartedAt, elapsedMs, sessionId, sessionFile, expectedFiles}`. The machine-readable half of the progress log — a monitoring loop is one read + JSON.parse, and the `expectedFiles` map answers "is the artifact there yet?" without an `ls`.
 - **Task from a file** (`--task-file <path>`, v0.11.0): long tasks belong in a file — no shell quoting, no truncation. The whole file (BOM/whitespace-trimmed) becomes the task; mutually exclusive with a positional/`--task` task. A task that happens to be an existing file path (the classic "I passed the path, not the text" bug — it cost a 2026-10-17 run a wasted discovery step) now gets an explicit `did you mean --task-file?` warning.
 - **Strict CLI** (v0.4.0): an unknown `--flag` is an error (exit 2). Unknown flags used to be joined into the task text — a typo'd flag became the child's *entire* task. At startup the supervisor echoes the resolved task (`[supervisor] task: N chars — "..."`) and warns when it is suspiciously short (< 100 chars). `rpc-child.mjs` rejects unknown flags the same way.
 
 ```bash
-node <skill_dir>/scripts/supervisor.mjs "Refactor module X to use Y; verify with the test suite"
+node <skill_dir>/scripts/guard.mjs "Refactor module X to use Y; verify with the test suite"
 ```
 
-- **Persists the session by default** (auto `--session-id sup-<timestamp>`, `--name` = the ID) so runs stay resumable. Every L2 fork creates a NEW session file — the RESULT line reports the **final** session (`sessionId`/`sessionFile`); resume THAT file with `rpc-child.mjs --session <file>` to continue or debug. `--no-session` for throwaway.
-- RESULT JSON: `{status: "completed"|"stuck"|"consult", exitReason: completed|completed-finalized|hard-timeout|stuck-loop|stuck-idle|aborted-external|degenerate-settle|missing-expected-file|stuck-stagnation|consult-loop|consult-stall|consult-external-abort|consult-error-loop|consult-heartbeat|consult-text-loop|consult-stagnation, task (≤200 chars) + taskChars, attempts, interventions: {steers, forks, loopsSeen}, sessionId, sessionFile, finalText (≤4000 chars) + finalTextTruncated, settle: {attemptTextChars, attemptToolCalls, lastMessageTextChars, errorStreakAtEnd}, expectedFiles (when given), progressLog, elapsedMs, recentToolCalls (last 15: {tool, args, isError, result≤300, durationMs, noContent?}), deadline (ISO), finalized (when the timeout was absorbed by the finalization window), manifest (path), consultFile/trigger/allowedActions (status=consult only)}`. The same summary is also written as a `[result]` line in the progress log, and the same payload + `cwd/provider/model/startedAt/finishedAt` is **always written to `pi-child-result.json` in the working directory** (the `manifest` field) — a stable small file the parent reads instead of digging the RESULT line out of a multi-hundred-KB log. Exit codes: 0 completed (incl. `completed-finalized`), 3 stuck, **4 consult** (waiting on the parent's resume), 1 error, 2 usage (including an unknown `--flag`).
-- Tuning: `--loop-threshold` (default **4** — one below the guard's default abort=5 so the steer lands first), `--max-steers`, `--max-forks`, `--idle-timeout`, `--tool-timeout`, `--timeout <min>` (hard wall clock, default 240; `0` = no wall clock / unlimited), `--finalize <min>` (finalization window at the wall clock, default 10, 0=off), `--expect-file <path>` (repeatable), `--keep-delegate-tool`, sensors (`--max-errors`, `--heartbeat`, `--max-text`, `--stagnation`), steering (`--consult`, `--consult-file`, `--action`, `--message`, `--steer-msg`, `--fork-note`), plus all harness session/model flags (`--provider`, `--model`, `--session-id`, `--session`, `--session-dir`, `--name`).
+- **Persists the session by default** (auto `--session-id sup-<timestamp>`, `--name` = the ID) so runs stay resumable. Every rewind/L2 fork creates a NEW session file — the RESULT line reports the **final** session (`sessionId`/`sessionFile`); resume THAT file with `rpc-child.mjs --session <file>` to continue or debug. `--no-session` for throwaway.
+- RESULT JSON: `{status: "completed"|"stuck"|"consult", exitReason: completed|completed-finalized|hard-timeout|stuck-loop|stuck-idle|aborted-external|degenerate-settle|missing-expected-file|stuck-stagnation|consult-loop|consult-stall|consult-external-abort|consult-error-loop|consult-heartbeat|consult-text-loop|consult-stagnation, task (≤200 chars) + taskChars, attempts, interventions: {steers, forks, rewinds, loopsSeen}, sessionId, sessionFile, finalText (≤4000 chars) + finalTextTruncated, settle: {attemptTextChars, attemptToolCalls, lastMessageTextChars, errorStreakAtEnd}, expectedFiles (when given), progressLog, elapsedMs, recentToolCalls (last 15: {tool, args, isError, result≤300, durationMs, noContent?}), deadline (ISO), finalized (when the timeout was absorbed by the finalization window), manifest (path), consultFile/trigger/allowedActions (status=consult only)}`. The same summary is also written as a `[result]` line in the progress log, and the same payload + `cwd/provider/model/startedAt/finishedAt` is **always written to `pi-child-result.json` in the working directory** (the `manifest` field) — a stable small file the parent reads instead of digging the RESULT line out of a multi-hundred-KB log. Exit codes: 0 completed (incl. `completed-finalized`), 3 stuck, **4 consult** (waiting on the parent's resume), 1 error, 2 usage (including an unknown `--flag`).
+- Tuning: `--loop-threshold` (default **4** — one below the guard's default abort=5 so the steer lands first), `--max-steers`, `--max-rewinds` (L1.5 budget, default **1**, `0` = off), `--max-forks`, `--idle-timeout`, `--tool-timeout`, `--timeout <min>` (hard wall clock, default 240; `0` = no wall clock / unlimited), `--finalize <min>` (finalization window at the wall clock, default 10, 0=off), `--expect-file <path>` (repeatable), `--keep-delegate-tool`, sensors (`--max-errors`, `--heartbeat`, `--max-text`, `--stagnation`), steering (`--consult`, `--consult-file`, `--action`, `--message`, `--steer-msg`, `--rewind-note`, `--fork-note`), plus all harness session/model flags (`--provider`, `--model`, `--session-id`, `--session`, `--session-dir`, `--name`).
 - If you run with a custom `repetitionGuard` config, set `--loop-threshold` one below its `abort` value so L1 always wins the race.
 
 ### Task authoring (what a good long task contains)
@@ -190,11 +191,11 @@ To run a long autonomous job **inside a container** — sandboxed filesystem, th
 host:      hypervisor.mjs   config generation, model forwarder, health checks,
                             image build, container lifecycle, no-progress
                             backstop, RESULT collection
-container: supervisor.mjs (unchanged) → child pi --mode rpc → model
+container: guard.mjs (unchanged) → child pi --mode rpc → model
 ```
 
 This is the Docker **variant** of the skill. The host variant (supervisor +
-child both on the host, no Docker) is `supervisor.mjs` directly — the two are
+child both on the host, no Docker) is `guard.mjs` directly — the two are
 alternatives, and all supervisor options work identically in both.
 
 Why 3 layers: the in-container supervisor owns the tight agent-behavior loop
@@ -352,7 +353,7 @@ Medium-IL hypervisor  scripts/integrity/hypervisor.mjs (node)
   |- health-checks the model endpoint (GET .../v1/models)
   |- [optional] copies --src project files into work/
   `- spawn-low.ps1  (self-downgrades the token to Low)
-       `- node supervisor.mjs   (supervisor + child pi at Low IL, cwd = work,
+       `- node guard.mjs   (supervisor + child pi at Low IL, cwd = work,
           isolated HOME/USERPROFILE/TEMP under <base>\home)
 ```
 
@@ -382,7 +383,7 @@ node scripts/integrity/hypervisor.mjs --model <id> [supervisor options] "task"
 
 Supervisor options (`--timeout`, `--expect-file`, `--loop-threshold`,
 `--max-forks`, `--max-errors`, `--consult`, ...) pass through unchanged —
-see `supervisor.mjs --help`. Progress log, `=== RESULT ===` line and exit
+see `guard.mjs --help`. Progress log, `=== RESULT ===` line and exit
 codes (0 completed / 1 infrastructure / 2 usage / 3 stuck / 4 consult) are
 identical to the other variants; the hypervisor additionally exits 90 on
 sandbox-setup or selftest failure and propagates 91 from spawn-low.ps1 if
@@ -450,7 +451,7 @@ the project and deny-on-everything-else.
 host user
   `- node scripts/user/hypervisor.mjs
        |- health-checks the model endpoint
-       |- stages supervisor.mjs + runner.mjs + selftest.ps1
+       |- stages guard.mjs + runner.mjs + selftest.ps1
        |    into C:\ProgramData\pi-supervisor  (world-readable;
        |    the only path both users can touch without a grant)
        |- [mode selftest]  or [mode run]
@@ -461,7 +462,7 @@ host user
                  |- writes the child's .pi config (models.json + auth.json)
                  |  and .gitconfig (safe.directory = project)
                  |- selftest: 11-check confinement matrix (exit 0/1)
-                 `- node supervisor.mjs (child pi, cwd = the project)
+                 `- node guard.mjs (child pi, cwd = the project)
 ```
 
 **Confinement (the ACL matrix, applied once — "tier 1" needs no admin):**
@@ -504,7 +505,7 @@ shows as `agent:(I)...`) are not mode state — a clean can never remove them
 from a child's own DACL, so counting them made the probe force a re-apply
 that then failed on the very same ACEs (die 90 on every launch, 2026-10-16).
 The probe logic lives in `scripts/user/reads-probe.mjs` (CLI:
-`node reads-probe.mjs <user> <dir>`; unit-tested in `test-supervisor.mjs`).
+`node reads-probe.mjs <user> <dir>`; unit-tested in `test-guard.mjs`).
 
 Apply ACLs with `icacls` or .NET (`[IO.Directory]::SetAccessControl` — works
 when the `Microsoft.PowerShell.Security` module is broken, which also breaks

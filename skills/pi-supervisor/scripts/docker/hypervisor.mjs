@@ -9,7 +9,7 @@
 //                |- watches the progress log for total no-progress
 //                |- restarts the container once on infrastructure failure (default)
 //                `- collects the supervisor's RESULT and reports it
-//   container: supervisor.mjs (unchanged, mounted from this skill)
+//   container: guard.mjs (unchanged, mounted from this skill)
 //                `- child `pi --mode rpc` -> model (host llama.cpp router via forwarder)
 //
 // Why 3 layers: the in-container supervisor owns the tight agent-behavior loop
@@ -23,7 +23,7 @@
 //   node scripts/docker/hypervisor.mjs "long autonomous task" [options]
 //
 // Supervisor options are passed through UNCHANGED to the in-container
-// supervisor.mjs (same names and semantics as running it directly):
+// guard.mjs (same names and semantics as running it directly):
 //   --task --session-id --session --no-session --session-dir --name
 //   --provider --model --loop-threshold --max-steers --max-forks
 //   --steer-msg --fork-note --consult --consult-file --action --message
@@ -89,13 +89,13 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const SCRIPTS_DIR = resolve(__dirname, ".."); // .../scripts (supervisor.mjs lives here)
+const SCRIPTS_DIR = resolve(__dirname, ".."); // .../scripts (guard.mjs lives here)
 
 const USAGE = `Usage:
   node hypervisor.mjs "long autonomous task" [options]
 
-3-layer docker run: host hypervisor -> container (supervisor.mjs + child pi).
-Supervisor options are passed through unchanged; see supervisor.mjs --help.
+3-layer docker run: host hypervisor -> container (guard.mjs + child pi).
+Supervisor options are passed through unchanged; see guard.mjs --help.
 
 Hypervisor options:
   --image <name>         Container image (default pi-supervisor:docker)
@@ -562,7 +562,7 @@ function dockerRunArgs() {
   a.push("-e", `PI_PROVIDER=${opt.provider}`);
   a.push("-e", `PI_MODEL=${opt.model}`);
   if (process.env.PI_REASONING_LEVEL) a.push("-e", `PI_REASONING_LEVEL=${process.env.PI_REASONING_LEVEL}`);
-  a.push(opt.image, "node", "/opt/pi-supervisor/supervisor.mjs");
+  a.push(opt.image, "node", "/opt/pi-supervisor/guard.mjs");
   a.push(...containerSupArgs());
   return a;
 }

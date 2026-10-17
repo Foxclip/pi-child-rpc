@@ -5,7 +5,7 @@
 //      (models.json, auth.json, settings.json) + a .gitconfig with safe.directory
 //   2. sets the env the supervisor + child need (PI_PROVIDER/PI_MODEL,
 //      PI_PACKAGE_DIR, GIT_CONFIG_GLOBAL, ...)
-//   3. execs supervisor.mjs with cwd = the project dir, inheriting stdio
+//   3. execs guard.mjs with cwd = the project dir, inheriting stdio
 //
 // It receives everything as a single base64 --spec argument so the ssh
 // command line carries no quotes/backslashes/spaces (PS/ssh quoting is the
@@ -39,8 +39,8 @@ for (const k of ["provider", "model", "baseUrl", "project"]) {
 const contextWindow = spec.contextWindow || 262144;
 const supArgs = Array.isArray(spec.supArgs) ? spec.supArgs : [];
 const stageDir = dirname(fileURLToPath(import.meta.url));
-const SUPERVISOR = join(stageDir, "supervisor.mjs");
-if (!existsSync(SUPERVISOR)) die(`error: staged supervisor.mjs not found: ${SUPERVISOR}`, 90);
+const SUPERVISOR = join(stageDir, "guard.mjs");
+if (!existsSync(SUPERVISOR)) die(`error: staged guard.mjs not found: ${SUPERVISOR}`, 90);
 
 // ---------------------------------------------------------------------------
 // Bootstrap the dedicated account's pi config (fresh per run, like integrity)
@@ -110,7 +110,7 @@ process.env.GIT_AUTHOR_EMAIL = "pi-child@local";
 process.env.GIT_COMMITTER_NAME = "pi-child";
 process.env.GIT_COMMITTER_EMAIL = "pi-child@local";
 
-// Resolve the account's own global pi install (same candidate order as supervisor.mjs)
+// Resolve the account's own global pi install (same candidate order as guard.mjs)
 function resolvePackageDir() {
   const candidates = [];
   if (process.env.PI_PACKAGE_DIR) candidates.push(process.env.PI_PACKAGE_DIR);

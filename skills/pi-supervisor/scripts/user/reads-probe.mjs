@@ -17,7 +17,7 @@
 //
 // CLI:    node reads-probe.mjs <user> <dir>   → prints allow|deny|unknown
 // Module: import { parseIcaclsMode, detectReadsMode } from "./reads-probe.mjs"
-//         (hypervisor.mjs uses detectReadsMode; test-supervisor.mjs
+//         (hypervisor.mjs uses detectReadsMode; test-guard.mjs
 //          unit-tests parseIcaclsMode)
 
 import { execFileSync } from "node:child_process";

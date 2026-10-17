@@ -8,13 +8,13 @@
 // Architecture (3 layers, all on this host):
 //
 //   Host user (this file, node)
-//     |- stages supervisor.mjs + runner.mjs + selftest.ps1 into --stage
+//     |- stages guard.mjs + runner.mjs + selftest.ps1 into --stage
 //        (default C:\ProgramData\pi-supervisor — host-writable, user-readable)
 //     |- health-checks the model endpoint
 //     `- ssh -i <key> -T <user>@127.0.0.1 "node <stage>\runner.mjs --spec <b64>"
 //          |- bootstraps the user's agent config (<home>/.pi/models.json,
 //             auth.json, settings.json, .gitconfig with safe.directory)
-//          `- node supervisor.mjs <supArgs> [task]   (supervisor + child pi
+//          `- node guard.mjs <supArgs> [task]   (supervisor + child pi
 //             run as the dedicated user, cwd = --project)
 //
 // What the dedicated user confines (verified by --selftest):
@@ -49,7 +49,7 @@
 //
 //   Supervisor options (--timeout, --expect-file, --loop-threshold,
 //   --max-forks, --max-errors, --consult, ...) are passed through unchanged;
-//   see supervisor.mjs --help. The task is the first positional arg or --task.
+//   see guard.mjs --help. The task is the first positional arg or --task.
 //
 // Exit codes: supervisor's own (0 completed, 1 infrastructure, 2 usage,
 // 3 stuck, 4 consult), 90 = setup/health failure, 91 = ssh spawn failure.
@@ -65,7 +65,7 @@ import { detectReadsMode } from "./reads-probe.mjs";
 
 const SCRIPTS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const USER_DIR = join(SCRIPTS_DIR, "user");
-const SUPERVISOR = join(SCRIPTS_DIR, "supervisor.mjs");
+const SUPERVISOR = join(SCRIPTS_DIR, "guard.mjs");
 
 function die(msg, code) {
   console.error(msg);
@@ -73,7 +73,7 @@ function die(msg, code) {
 }
 
 // ---------------------------------------------------------------------------
-// CLI (strict; unknown --flags are passed to supervisor.mjs verbatim)
+// CLI (strict; unknown --flags are passed to guard.mjs verbatim)
 // ---------------------------------------------------------------------------
 const RESERVABLE = new Set([
   "user", "key", "project", "model", "model-input", "provider", "model-base-url", "api-key",
@@ -104,7 +104,7 @@ const supArgs = [];
 let task = "";
 
 function usage() {
-  console.log(`user/hypervisor.mjs — run supervisor.mjs as a dedicated standard user over SSH (no admin, no docker)
+  console.log(`user/hypervisor.mjs — run guard.mjs as a dedicated standard user over SSH (no admin, no docker)
 
 options:
   --user <name>          dedicated account (default "agent")
@@ -139,7 +139,7 @@ options:
                                  outside (on this machine E: allows both
                                  reads and writes)
   <task>                 positional task text
-  everything else        passed through to supervisor.mjs (see its --help)
+  everything else        passed through to guard.mjs (see its --help)
 
 examples:
   node hypervisor.mjs --key C:\\keys\\agent_key --project E:\\Projects\\Foo "add the feature; run the tests"
@@ -239,12 +239,12 @@ function sshTarget() {
 // ---------------------------------------------------------------------------
 function stage() {
   mkdirSync(opt.stage, { recursive: true });
-  for (const f of ["supervisor.mjs", "runner.mjs", "selftest.ps1"]) {
-    const src = f === "supervisor.mjs" ? SUPERVISOR : join(USER_DIR, f);
+  for (const f of ["guard.mjs", "runner.mjs", "selftest.ps1"]) {
+    const src = f === "guard.mjs" ? SUPERVISOR : join(USER_DIR, f);
     if (!existsSync(src)) die(`error: missing skill file: ${src}`, 90);
     copyFileSync(src, join(opt.stage, f));
   }
-  log(`staged supervisor.mjs + runner.mjs + selftest.ps1 -> ${opt.stage}`);
+  log(`staged guard.mjs + runner.mjs + selftest.ps1 -> ${opt.stage}`);
 }
 
 // ---------------------------------------------------------------------------

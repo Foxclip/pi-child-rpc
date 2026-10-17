@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// supervisor.mjs — run ONE long autonomous task in a child pi agent (RPC mode)
+// guard.mjs — run ONE long autonomous task in a child pi agent (RPC mode)
 // and supervise it: detect repetitive tool-call loops and stalls, and escalate
 // (steer → fork+retry → give up) instead of letting a watchdog kill the run.
 //
@@ -8,7 +8,7 @@
 //   `repetitionGuard`, defaults warn=3 / abort=5, counter is PER SESSION)
 //   refuses the 5th consecutive byte-identical tool call and ABORTS THE
 //   TURN — that kills long autonomous jobs. A supervised child instead gets
-//   an escalation ladder from the supervisor:
+//   an escalation ladder from the guard:
 //     L1  steer() a corrective message (the programmatic "please continue")
 //         — fires at --loop-threshold (default 4, i.e. BEFORE the guard's
 //         abort-at-5)
@@ -17,20 +17,22 @@
 //         a fork is a NEW session, so the guard's per-session counter starts
 //         clean too)
 //     L3  give up: RESULT status=stuck, exit 3
-//   External aborts (agent_settled aborted=true not caused by the supervisor
+//   External aborts (agent_settled aborted=true not caused by the guard
 //   — the guard firing at 5, or any other host-side abort) are recoverable:
 //   straight to L2 while fork budget remains.
 //
 //   Consult mode (--consult): instead of L1/L2 firing with built-in messages,
-//   the supervisor PAUSES at the intervention point: it persists the session,
+//   the guard PAUSES at the intervention point: it persists the session,
 //   writes pi-child-consult.json (trigger, loop stats, recent tool calls, last
 //   assistant text, budgets, session id/file) and exits 4 with
 //   RESULT status=consult. The parent session then decides and re-invokes:
-//     node supervisor.mjs --consult-file pi-child-consult.json \
-//       --action steer|fork|continue --message "your steering instruction"
+//     node guard.mjs --consult-file pi-child-consult.json \
+//       --action steer|fork|rewind|continue --message "your steering instruction"
 //   steer    = send your message into the same session, in place
 //   fork     = branch before the task message + re-prompt task+message
 //              (new session file, fresh guard counter) — like L2, with your note
+//   rewind   = branch right BEFORE the task message + re-prompt the task
+//              followed by your message (stuck loop discarded) — like L1.5
 //   continue = resume with the built-in ladder for the rest of the run
 //   Budgets, attempt count and the hard wall clock carry across resumes.
 //
@@ -59,7 +61,7 @@
 //       text deltas, so the stall detector sees a healthy, busy child.
 //
 // Usage:
-//   node supervisor.mjs "task description" [options]
+//   node guard.mjs "task description" [options]
 //
 // Behavior:
 //   - Single prompt = one autonomous job; the child works until it settles.
@@ -69,7 +71,7 @@
 //     --tool-timeout while one tool call is running → straight to L2 (a steer
 //     cannot reach a hung LLM call).
 //   - --timeout is the hard wall clock. With --finalize <min> (default 10,
-//     0=off) the expiry does NOT kill the run: the supervisor prompts
+//     0=off) the expiry does NOT kill the run: the guard prompts
 //     "stop new work, write the final report now" and waits up to N minutes
 //     for a settle (the ladder is suppressed) → exitReason=
 //     completed-finalized (exit 0) when a report lands, hard-timeout
@@ -113,7 +115,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const USAGE = `Usage:
-  node supervisor.mjs "autonomous task description" [options]
+  node guard.mjs "autonomous task description" [options]
 Options:
   --task <t>            Task text (alternative to the positional argument)
   --task-file <path>    Task text from a file (whole file, BOM/whitespace
@@ -132,9 +134,12 @@ Options:
                         (default: 4 — fires one before the host repetition
                         guard's default abort-at-5, so the steer lands first)
   --max-steers <n>      L1 budget: corrective steer messages (default: 3)
+  --max-rewinds <n>     L1.5 budget: abort+rewind attempts (default: 1, 0=off)
   --max-forks <n>       L2 budget: abort+fork+retry attempts (default: 2)
   --steer-msg <t>       Full replacement for the built-in L1 steer message
                         (variables: {tool}, {count})
+  --rewind-note <t>     Full replacement for the built-in L1.5 rewind re-prompt
+                        note (variable: {reason})
   --fork-note <t>       Full replacement for the built-in L2 fork re-prompt
                         note (variable: {reason})
   --consult             Consult mode: on an intervention, persist the session,
@@ -157,7 +162,7 @@ Options:
                         (long builds are normal; default 1800)
   --timeout <min>       Hard wall clock for the whole job (default: 240; 0 = no wall clock / unlimited)
   --finalize <min>      Finalization window at the hard timeout (default 10;
-                        0=off): at the wall clock the supervisor does not die
+                        0=off): at the wall clock the guard does not die
                         — it prompts "STOP new work, write the final report
                         now" and waits up to N minutes for a settle. A settle
                         with a report → exitReason=completed-finalized (exit
@@ -186,8 +191,8 @@ Options:
 Resume from a consult file (instead of a task):
   --consult-file <p>    Consult file to resume from (usually
                         pi-child-consult.json; path is in the RESULT line)
-  --action <a>          steer | fork | continue (required with --consult-file)
-  --message <t>         Parent-authored message for --action steer|fork
+  --action <a>          steer | fork | rewind | continue (required with --consult-file)
+  --message <t>         Parent-authored message for --action steer|fork|rewind
   -h, --help            Show this help`;
 
 const argv = process.argv.slice(2);
@@ -204,8 +209,10 @@ let model = process.env.PI_MODEL || "";
 let loopThreshold = 4;
 let maxSteers = 3;
 let maxForks = 2;
+let maxRewinds = 1;
 let steerMsg = "";
 let forkNote = "";
+let rewindNote = "";
 let consult = false;
 let consultFileArg = "";
 let resumeAction = "";
@@ -227,7 +234,7 @@ let preamble = "";
 const VALID_FLAGS = [
   "--task", "--task-file", "--session-id", "--session", "--no-session", "--session-dir",
   "--name", "--provider", "--model", "--loop-threshold", "--max-steers",
-  "--max-forks", "--steer-msg", "--fork-note", "--consult", "--consult-file",
+  "--max-forks", "--max-rewinds", "--steer-msg", "--rewind-note", "--fork-note", "--consult", "--consult-file",
   "--action", "--message", "--max-errors", "--heartbeat", "--max-text",
   "--idle-timeout", "--tool-timeout", "--timeout", "--finalize", "--stagnation",
   "--progress-log", "--expect-file", "--preamble", "--keep-question-tool",
@@ -249,7 +256,9 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--loop-threshold") loopThreshold = Number(argv[++i]);
   else if (a === "--max-steers") maxSteers = Number(argv[++i]);
   else if (a === "--max-forks") maxForks = Number(argv[++i]);
+  else if (a === "--max-rewinds") maxRewinds = Number(argv[++i]);
   else if (a === "--steer-msg") steerMsg = argv[++i];
+  else if (a === "--rewind-note") rewindNote = argv[++i];
   else if (a === "--fork-note") forkNote = argv[++i];
   else if (a === "--consult") consult = true;
   else if (a === "--consult-file") consultFileArg = argv[++i];
@@ -294,12 +303,12 @@ if (consultFileArg) {
     );
     process.exit(2);
   }
-  if (!["steer", "fork", "continue"].includes(resumeAction)) {
-    console.error("error: --consult-file requires --action steer|fork|continue");
+  if (!["steer", "fork", "rewind", "continue"].includes(resumeAction)) {
+    console.error("error: --consult-file requires --action steer|fork|rewind|continue");
     process.exit(2);
   }
   if (resumeAction !== "continue" && !resumeMessage) {
-    console.error("error: --action steer|fork requires --message <text>");
+    console.error("error: --action steer|fork|rewind requires --message <text>");
     process.exit(2);
   }
   try {
@@ -384,6 +393,7 @@ for (const [flag, value] of [
   ["--loop-threshold", loopThreshold],
   ["--max-steers", maxSteers],
   ["--max-forks", maxForks],
+  ["--max-rewinds", maxRewinds],
   ["--max-errors", maxErrors],
   ["--heartbeat", heartbeatN],
   ["--max-text", maxTextLen],
@@ -519,6 +529,7 @@ let startTs = 0;
 let attempt = 1;
 let steersUsed = 0;
 let forksUsed = 0;
+let rewindsUsed = 0;
 let loopsSeen = 0;
 let abortedByMe = false;
 let finalTextAcc = "";
@@ -572,6 +583,7 @@ function writeStatus(status, exitReason) {
       status, // running | completed | stuck | consult | error
       exitReason: exitReason || undefined,
       attempt,
+      rewinds: rewindsUsed,
       toolCalls: totalToolCalls,
       lastTool: lastToolName || null,
       lastToolStartedAt: lastToolStartedAt > 0 ? new Date(lastToolStartedAt).toISOString() : null,
@@ -622,6 +634,7 @@ function consultAllowed(trigger) {
       trigger === "degenerate-settle" ||
       trigger === "missing-expected-file") && steersUsed < maxSteers
   ) acts.push("steer");
+  if (rewindsUsed < maxRewinds && maxRewinds > 0 && checkpointId) acts.push("rewind");
   if (forksUsed < maxForks) acts.push("fork");
   acts.push("continue");
   return acts;
@@ -646,9 +659,11 @@ async function doConsult(trigger, extra) {
     attempt,
     steersUsed,
     forksUsed,
+    rewindsUsed,
     loopsSeen,
     maxSteers,
     maxForks,
+    maxRewinds,
     startTs,
     hardTimeoutMs,
     sessionId: stateSessionId || null,
@@ -667,7 +682,7 @@ async function doConsult(trigger, extra) {
   consultOut = payload;
   outcome = `consult-${trigger}`;
   logSup(
-    `[supervisor] CONSULT (${trigger}): payload → ${p}; allowed actions: ` +
+    `[guard] CONSULT (${trigger}): payload → ${p}; allowed actions: ` +
       `${payload.allowedActions.join("|")}. The child is being shut down orderly; ` +
       `the session persists — resume with --consult-file to steer.`
   );
@@ -741,7 +756,7 @@ async function findCheckpoint() {
       if (e && e.type === "message" && e.message && e.message.role === "user") return e.id;
     }
   } catch (e) {
-    logSup(`[supervisor] getEntries failed: ${e.message}`);
+    logSup(`[guard] getEntries failed: ${e.message}`);
   }
   return null;
 }
@@ -759,9 +774,9 @@ async function doSteer(pl) {
       `now occurred ${pl.count} times in a row without progress. Stop. Reassess the situation, ` +
       `pick a DIFFERENT concrete next step, and continue with the original task. Do not repeat ` +
       `that failing call; if the task cannot proceed, say exactly where it is blocked.`;
-  logSup(`[supervisor] L1 steer #${steersUsed}/${maxSteers}: loop on ${pl.toolName} x${pl.count}`);
+  logSup(`[guard] L1 steer #${steersUsed}/${maxSteers}: loop on ${pl.toolName} x${pl.count}`);
   const disp = await client.steer(msg);
-  logSup(`[supervisor] steer disposition=${disp}`);
+  logSup(`[guard] steer disposition=${disp}`);
   writeStatus("running");
 }
 
@@ -774,7 +789,7 @@ async function doFork(reason) {
   forksUsed++;
   if (pendingLoop) loopsSeen++;
   pendingLoop = null;
-  logSup(`[supervisor] L2 fork #${forksUsed}/${maxForks}: ${reason}`);
+  logSup(`[guard] L2 fork #${forksUsed}/${maxForks}: ${reason}`);
   abortedByMe = true;
   toolDepth = 0;
   resetAttemptCounters();
@@ -783,7 +798,7 @@ async function doFork(reason) {
   try {
     await client.abort();
   } catch (e) {
-    logSup(`[supervisor] abort warn: ${e.message}`);
+    logSup(`[guard] abort warn: ${e.message}`);
   }
   try {
     await client.clearQueue();
@@ -791,12 +806,12 @@ async function doFork(reason) {
   if (checkpointId) {
     try {
       const r = await client.fork(checkpointId);
-      if (r && r.cancelled) logSup("[supervisor] fork cancelled by an extension; retrying in place");
+      if (r && r.cancelled) logSup("[guard] fork cancelled by an extension; retrying in place");
     } catch (e) {
-      logSup(`[supervisor] fork failed (${e.message}); retrying in the same session`);
+      logSup(`[guard] fork failed (${e.message}); retrying in the same session`);
     }
   } else {
-    logSup("[supervisor] no checkpoint available; retrying in the same session");
+    logSup("[guard] no checkpoint available; retrying in the same session");
   }
   try {
     const st = await client.getState();
@@ -805,7 +820,7 @@ async function doFork(reason) {
       stateSessionFile = st.sessionFile ?? stateSessionFile;
     }
   } catch { /* best effort */ }
-  logSup(`[supervisor] session now id=${stateSessionId || "?"} file=${stateSessionFile || "?"}`);
+  logSup(`[guard] session now id=${stateSessionId || "?"} file=${stateSessionFile || "?"}`);
   attempt++;
   finalTextAcc = "";
   const note = forkNote
@@ -820,6 +835,67 @@ async function doFork(reason) {
   toolDepth = 0;
   lastEventAt = Date.now();
   writeStatus("running");
+}
+
+// L1.5: abort + rewind + re-prompt. pi's RPC fork() only accepts user-message
+// entries and branches BEFORE them, so the rewind forks at the checkpoint
+// (the task message) and re-prompts the task followed by a note — the
+// transcript after the rewind is [system..., task, note], stuck loop
+// discarded. Same shape as L2's fork; differs only in note text and budget.
+async function doRewind(reason) {
+  if (!checkpointId) {
+    logSup("[guard] rewind skipped: no checkpoint entry to branch from");
+    return false;
+  }
+  rewindsUsed++;
+  if (pendingLoop) loopsSeen++;
+  pendingLoop = null;
+  logSup(`[guard] L1.5 rewind #${rewindsUsed}/${maxRewinds}: ${reason}`);
+  abortedByMe = true;
+  toolDepth = 0;
+  resetAttemptCounters();
+  steersThisAttempt = 0;
+  sensorHold = null;
+  try {
+    await client.abort();
+  } catch (e) {
+    logSup(`[guard] abort warn: ${e.message}`);
+  }
+  try {
+    await client.clearQueue();
+  } catch { /* best effort */ }
+  try {
+    const r = await client.fork(checkpointId);
+    if (r && r.cancelled) logSup("[guard] rewind fork cancelled by an extension; continuing in the same session");
+  } catch (e) {
+    logSup(`[guard] rewind fork failed (${e.message})`);
+    return false;
+  }
+  try {
+    const st = await client.getState();
+    if (st) {
+      stateSessionId = st.sessionId ?? stateSessionId;
+      stateSessionFile = st.sessionFile ?? stateSessionFile;
+    }
+  } catch { /* best effort */ }
+  logSup(`[guard] session now id=${stateSessionId || "?"} file=${stateSessionFile || "?"}`);
+  attempt++;
+  finalTextAcc = "";
+  const note = rewindNote
+    ? fillTemplate(rewindNote, { reason })
+    : `You were just rewound: a previous attempt at this task ${reason}, and that attempt ` +
+      `history has been discarded — you are starting the attempt over. The task is restated ` +
+      `above this note. Do NOT repeat the approach that just looped. Break the work into ` +
+      `smaller steps, verify assumptions as you go, and if you cannot proceed, finish with a ` +
+      `clear explanation of exactly where you are blocked.`;
+  await client.prompt(task + "\n\n" + note);
+  checkpointId = await findCheckpoint();
+  lastSig = null;
+  loopCount = 0;
+  toolDepth = 0;
+  lastEventAt = Date.now();
+  writeStatus("running");
+  return true;
 }
 
 // Settle quality. A healthy completion ends with a written report; a model
@@ -847,7 +923,7 @@ async function inspectSettle() {
       }
     }
   } catch (e) {
-    logSup(`[supervisor] settle inspection warn: ${e.message}`);
+    logSup(`[guard] settle inspection warn: ${e.message}`);
   }
   return info;
 }
@@ -860,16 +936,16 @@ async function doDegenerateSteer(dReason, missing) {
   resetAttemptCounters();
   const msg =
     missing.length > 0
-      ? `[supervisor] You ended your turn without creating the required file(s): ${missing.join(", ")}. ` +
+      ? `[guard] You ended your turn without creating the required file(s): ${missing.join(", ")}. ` +
         `Create them, then finish with a clear written status update.`
-      : `[supervisor] You ended your turn ${dReason}. That is not a valid completion — continue ` +
+      : `[guard] You ended your turn ${dReason}. That is not a valid completion — continue ` +
         `the task from where you left off and finish with a clear written status update.`;
   logSup(
-    `[supervisor] L1 settle-steer #${steersUsed}/${maxSteers}: ` +
+    `[guard] L1 settle-steer #${steersUsed}/${maxSteers}: ` +
       `${missing.length > 0 ? "missing expected file(s)" : "degenerate settle"}`
   );
   const disp = await client.prompt(msg);
-  logSup(`[supervisor] settle-steer disposition=${disp}`);
+  logSup(`[guard] settle-steer disposition=${disp}`);
   writeStatus("running");
 }
 
@@ -883,20 +959,20 @@ try {
   }
   logSup(`[info] starting supervised child: ${cliPath} --mode rpc ${args.join(" ")}`);
   logSup(
-    `[supervisor] loop-threshold=${loopThreshold} max-steers=${maxSteers} max-forks=${maxForks} ` +
+    `[guard] loop-threshold=${loopThreshold} max-steers=${maxSteers} max-forks=${maxForks} ` +
       `idle=${Math.round(idleTimeoutMs / 1000)}s tool=${Math.round(toolTimeoutMs / 1000)}s ` +
       `hard=${hardTimeoutMs > 0 ? Math.round(hardTimeoutMs / 60000) + "min" : "none"}`
   );
   logSup(
-    `[supervisor] task: ${task.length} chars — "${task.slice(0, 160).replace(/\s+/g, " ")}${task.length > 160 ? "…" : ""}"`
+    `[guard] task: ${task.length} chars — "${task.slice(0, 160).replace(/\s+/g, " ")}${task.length > 160 ? "…" : ""}"`
   );
-  if (expectFiles.length > 0) logSup(`[supervisor] expected files: ${expectFiles.join(", ")}`);
-  logSup(`[supervisor] progress log: ${progressLogPath}`);
-  logSup(`[supervisor] status file: ${statusFilePath}`);
+  if (expectFiles.length > 0) logSup(`[guard] expected files: ${expectFiles.join(", ")}`);
+  logSup(`[guard] progress log: ${progressLogPath}`);
+  logSup(`[guard] status file: ${statusFilePath}`);
   writeStatus("running");
   if (loopThreshold >= 5) {
     logSup(
-      "[supervisor] NOTE: threshold >= 5 means the host repetition guard " +
+      "[guard] NOTE: threshold >= 5 means the host repetition guard " +
         "(default abort=5, see acp.json `repetitionGuard`) usually aborts the " +
         "turn before your steer fires; external aborts are still recovered via fork"
     );
@@ -921,9 +997,11 @@ try {
     attempt = resumePayload.attempt ?? 1;
     steersUsed = resumePayload.steersUsed ?? 0;
     forksUsed = resumePayload.forksUsed ?? 0;
+    rewindsUsed = resumePayload.rewindsUsed ?? 0;
     loopsSeen = resumePayload.loopsSeen ?? 0;
     maxSteers = resumePayload.maxSteers ?? maxSteers;
     maxForks = resumePayload.maxForks ?? maxForks;
+    maxRewinds = resumePayload.maxRewinds ?? maxRewinds;
     startTs = resumePayload.startTs ?? startTs;
     hardTimeoutMs = resumePayload.hardTimeoutMs ?? hardTimeoutMs;
     computeDeadline(); // startTs/hardTimeoutMs were restored from the file
@@ -931,7 +1009,7 @@ try {
     lastEventAt = Date.now();
     resetAttemptCounters();
     logSup(
-      `[supervisor] RESUME (action=${resumeAction}) attempt=${attempt} ` +
+      `[guard] RESUME (action=${resumeAction}) attempt=${attempt} ` +
         `steers=${steersUsed}/${maxSteers} forks=${forksUsed}/${maxForks} session=${stateSessionId || "?"}`
     );
     if (resumeAction === "fork") {
@@ -943,9 +1021,9 @@ try {
       attempt++;
       try {
         const r = await client.fork(checkpointId);
-        if (r && r.cancelled) logSup("[supervisor] fork cancelled by an extension; continuing in the same session");
+        if (r && r.cancelled) logSup("[guard] fork cancelled by an extension; continuing in the same session");
       } catch (e) {
-        logSup(`[supervisor] fork failed (${e.message}); continuing in the same session`);
+        logSup(`[guard] fork failed (${e.message}); continuing in the same session`);
       }
       try {
         const st = await client.getState();
@@ -954,20 +1032,44 @@ try {
           stateSessionFile = st.sessionFile ?? stateSessionFile;
         }
       } catch { /* best effort */ }
-      logSup(`[supervisor] session now id=${stateSessionId || "?"} file=${stateSessionFile || "?"}`);
+      logSup(`[guard] session now id=${stateSessionId || "?"} file=${stateSessionFile || "?"}`);
       const d = await client.prompt(task + "\n\n" + resumeMessage);
-      logSup(`[supervisor] fork re-prompt disposition=${d}`);
+      logSup(`[guard] fork re-prompt disposition=${d}`);
+      checkpointId = await findCheckpoint();
+    } else if (resumeAction === "rewind") {
+      if (!checkpointId) {
+        console.error("error: consult file has no taskEntryId; cannot rewind");
+        process.exit(1);
+      }
+      rewindsUsed++;
+      attempt++;
+      try {
+        const r = await client.fork(checkpointId);
+        if (r && r.cancelled) logSup("[guard] rewind fork cancelled by an extension; continuing in the same session");
+      } catch (e) {
+        logSup(`[guard] rewind fork failed (${e.message}); continuing in the same session`);
+      }
+      try {
+        const st = await client.getState();
+        if (st) {
+          stateSessionId = st.sessionId ?? stateSessionId;
+          stateSessionFile = st.sessionFile ?? stateSessionFile;
+        }
+      } catch { /* best effort */ }
+      logSup(`[guard] session now id=${stateSessionId || "?"} file=${stateSessionFile || "?"}`);
+      const d = await client.prompt(task + "\n\n" + resumeMessage);
+      logSup(`[guard] rewind re-prompt disposition=${d}`);
       checkpointId = await findCheckpoint();
     } else if (resumeAction === "steer") {
       steersUsed++;
       const d = await client.prompt(resumeMessage);
-      logSup(`[supervisor] steer disposition=${d}`);
+      logSup(`[guard] steer disposition=${d}`);
     } else {
       // continue: hand the remaining budget to the built-in ladder
       const d = await client.prompt(
-        "[supervisor] Supervision was paused and has now resumed. Continue the original task from where you left off."
+        "[guard] Supervision was paused and has now resumed. Continue the original task from where you left off."
       );
-      logSup(`[supervisor] continue disposition=${d}`);
+      logSup(`[guard] continue disposition=${d}`);
       consultMode = false;
     }
   } else {
@@ -977,7 +1079,7 @@ try {
     // prompt so the child can pace itself (and the finalization window, when
     // enabled, becomes meaningful).
     const deadlineNote = hardTimeoutMs > 0
-      ? `\n\n[supervisor] HARD DEADLINE: the wall clock for this run ends at ${deadlineLocal} ` +
+      ? `\n\n[guard] HARD DEADLINE: the wall clock for this run ends at ${deadlineLocal} ` +
         `(${deadlineIso} UTC; ${Math.round(hardTimeoutMs / 60000)} minutes from start).` +
         (finalizeMin > 0
           ? ` After that you get one final chance to write your final report, then the process is force-killed.`
@@ -985,13 +1087,13 @@ try {
         ` Plan to finish the task — and any required report files — before the deadline.`
       : ""; // --timeout 0 = unlimited: there is no wall clock to pace against
     const disp0 = await client.prompt(task + deadlineNote);
-    logSup(`[supervisor] prompt disposition=${disp0}`);
+    logSup(`[guard] prompt disposition=${disp0}`);
     if (hardTimeoutMs > 0) {
-      logSup(`[supervisor] hard deadline: ${deadlineLocal} (${deadlineIso} UTC)` + (finalizeMin > 0 ? ` + ${finalizeMin}min finalization window` : ""));
+      logSup(`[guard] hard deadline: ${deadlineLocal} (${deadlineIso} UTC)` + (finalizeMin > 0 ? ` + ${finalizeMin}min finalization window` : ""));
     }
     checkpointId = await findCheckpoint();
     if (!checkpointId) {
-      logSup("[supervisor] WARN: no checkpoint entry found; L2 forks will retry in place");
+      logSup("[guard] WARN: no checkpoint entry found; L2 forks will retry in place");
     }
   }
 
@@ -1018,11 +1120,11 @@ try {
             const strayTail = si.textChars === 0 && si.thinkingChars > 0 && attemptTextChars < 200;
             if (!emptyStop && !strayTail && missing.length === 0) {
               outcome = "completed-finalized";
-              logSup("[supervisor] settled during the finalization window with a report — completed-finalized");
+              logSup("[guard] settled during the finalization window with a report — completed-finalized");
             } else {
               outcome = "hard-timeout";
               logSup(
-                `[supervisor] finalization settle degenerate/missing (missing=${missing.join(",") || "none"}) — hard-timeout`
+                `[guard] finalization settle degenerate/missing (missing=${missing.join(",") || "none"}) — hard-timeout`
               );
             }
             settled = true;
@@ -1072,8 +1174,8 @@ try {
             const dReason = emptyStop
               ? `with no text and no tool activity`
               : `with a thinking-only final message (${si.thinkingChars} chars of thinking) after only ${attemptTextChars} chars of attempt text`;
-            if (degenerate) logSup(`[supervisor] degenerate settle: ended ${dReason}`);
-            if (missing.length > 0) logSup(`[supervisor] missing expected file(s): ${missing.join(", ")}`);
+            if (degenerate) logSup(`[guard] degenerate settle: ended ${dReason}`);
+            if (missing.length > 0) logSup(`[guard] missing expected file(s): ${missing.join(", ")}`);
             const trigger = missing.length > 0 ? "missing-expected-file" : "degenerate-settle";
             if (consultMode && (steersUsed < maxSteers || forksUsed < maxForks)) {
               await doConsult(trigger, {
@@ -1117,17 +1219,17 @@ try {
         budgetWarned = true;
         const remainMin = Math.max(1, Math.round((hardTimeoutMs - (now - startTs)) / 60000));
         const warnMsg =
-          `[supervisor] BUDGET WARNING: ~${remainMin} minutes remain until the hard deadline ` +
+          `[guard] BUDGET WARNING: ~${remainMin} minutes remain until the hard deadline ` +
           `(${deadlineLocal}). Do NOT start new work items. Finish the current item, then write ` +
           `your final report and required files NOW (mark unfinished items clearly) so they can ` +
           `be recovered even if the deadline hits.`;
-        logSup(`[supervisor] BUDGET WARNING sent at 90% of the budget`);
+        logSup(`[guard] BUDGET WARNING sent at 90% of the budget`);
         plog(`[budget] ${new Date().toISOString()} ~${remainMin}min remaining\n`);
         try {
           const disp = toolDepth > 0 ? await client.steer(warnMsg) : await client.prompt(warnMsg);
-          logSup(`[supervisor] budget-warning disposition=${disp}`);
+          logSup(`[guard] budget-warning disposition=${disp}`);
         } catch (e) {
-          logSup(`[supervisor] budget-warning warn: ${e.message}`);
+          logSup(`[guard] budget-warning warn: ${e.message}`);
         }
         continue;
       }
@@ -1135,18 +1237,18 @@ try {
         if (finalizeMin > 0) {
           finalized = true;
           finalizeDeadlineMs = now + finalizeMin * 60000;
-          logSup(`[supervisor] HARD TIMEOUT at the wall clock — entering a ${finalizeMin}-minute finalization window (ladder suppressed)`);
+          logSup(`[guard] HARD TIMEOUT at the wall clock — entering a ${finalizeMin}-minute finalization window (ladder suppressed)`);
           plog(`[finalize] ${new Date().toISOString()} window=${finalizeMin}min\n`);
           try {
             const disp = await client.prompt(
-              `[supervisor] HARD DEADLINE REACHED — you have ${finalizeMin} minutes before the process ` +
+              `[guard] HARD DEADLINE REACHED — you have ${finalizeMin} minutes before the process ` +
               `is force-killed. STOP all new work immediately. Write the final report NOW with the ` +
               `partial results gathered so far (state explicitly what is done, what is unfinished ` +
               `and why). This prompt runs after your current turn ends.`
             );
-            logSup(`[supervisor] finalize prompt disposition=${disp}`);
+            logSup(`[guard] finalize prompt disposition=${disp}`);
           } catch (e) {
-            logSup(`[supervisor] finalize prompt warn: ${e.message}`);
+            logSup(`[guard] finalize prompt warn: ${e.message}`);
           }
           continue;
         }
@@ -1170,6 +1272,12 @@ try {
       if (steersUsed < maxSteers) {
         await doSteer(pendingLoop);
         continue;
+      }
+      if (rewindsUsed < maxRewinds && maxRewinds > 0 && checkpointId) {
+        const rewound = await doRewind(
+          `looped repeatedly on \`${pendingLoop.toolName}\` (${pendingLoop.count}+ identical calls in a row)`
+        );
+        if (rewound) continue;
       }
       if (forksUsed < maxForks) {
         await doFork(`looped repeatedly on \`${pendingLoop.toolName}\` (${pendingLoop.count}+ identical calls in a row)`);
@@ -1207,13 +1315,13 @@ try {
           steersUsed++;
           loopsSeen++;
           const msg = sensor.kind === "error-loop"
-            ? `[supervisor] ${sensor.detail}. Stop repeating the failing approach: change your method or verify an assumption, then continue. If it cannot work, say exactly where it is blocked.`
+            ? `[guard] ${sensor.detail}. Stop repeating the failing approach: change your method or verify an assumption, then continue. If it cannot work, say exactly where it is blocked.`
             : sensor.kind === "stagnation"
-              ? `[supervisor] ${sensor.detail}. Stop probing a path that returns nothing: change your method, and if this target cannot work in this environment, record the finding and move on to the next item.`
-              : `[supervisor] You have written ${textSinceTool} chars of text without taking a tool action. Stop narrating and take the next concrete action with a tool call.`;
-          logSup(`[supervisor] L1 ${sensor.kind} steer #${steersUsed}/${maxSteers}: ${sensor.detail}`);
+              ? `[guard] ${sensor.detail}. Stop probing a path that returns nothing: change your method, and if this target cannot work in this environment, record the finding and move on to the next item.`
+              : `[guard] You have written ${textSinceTool} chars of text without taking a tool action. Stop narrating and take the next concrete action with a tool call.`;
+          logSup(`[guard] L1 ${sensor.kind} steer #${steersUsed}/${maxSteers}: ${sensor.detail}`);
           const disp = await client.steer(msg);
-          logSup(`[supervisor] ${sensor.kind} steer disposition=${disp}`);
+          logSup(`[guard] ${sensor.kind} steer disposition=${disp}`);
           continue;
         } else if (forksUsed < maxForks) {
           await doFork(`${sensor.kind}: ${sensor.detail}`);
@@ -1259,7 +1367,7 @@ try {
     task: task.length > 200 ? task.slice(0, 200) + `…(+${task.length - 200} chars)` : task,
     taskChars: task.length,
     attempts: attempt,
-    interventions: { steers: steersUsed, forks: forksUsed, loopsSeen },
+    interventions: { steers: steersUsed, forks: forksUsed, rewinds: rewindsUsed, loopsSeen },
     sessionId: stateSessionId || null,
     sessionFile: stateSessionFile || null,
     finalText: finalText.slice(0, 4000),

@@ -15,10 +15,10 @@
 //     |- [optional] copies --src project files into work/
 //     |- no model forwarder is needed: the child is on this host, so
 //        --model-base-url points straight at the model server
-//     `- spawns powershell spawn-low.ps1 -Spec {exe: node, args: [supervisor.mjs, ...]}
+//     `- spawns powershell spawn-low.ps1 -Spec {exe: node, args: [guard.mjs, ...]}
 //          |- self-downgrades its token to Low (OpenProcessToken with
 //             TOKEN_QUERY|TOKEN_ADJUST_DEFAULT + SetTokenInformation)
-//          `- node supervisor.mjs <supArgs>   (supervisor + child pi run at Low IL,
+//          `- node guard.mjs <supArgs>   (supervisor + child pi run at Low IL,
 //             cwd = work, isolated HOME/USERPROFILE/TEMP under <base>\home)
 //
 // What Low IL protects (verified by --selftest):
@@ -34,7 +34,7 @@
 //
 //   Supervisor options (--timeout, --expect-file, --loop-threshold, --max-forks,
 //   --max-errors, --consult, ...) are passed through unchanged; see
-//   supervisor.mjs --help. The task is the first positional arg or --task.
+//   guard.mjs --help. The task is the first positional arg or --task.
 //
 // Exit codes: supervisor's own (0 completed, 1 infrastructure, 2 usage,
 // 3 stuck, 4 consult), 90 = sandbox setup failed, 91 = downgrade failed
@@ -51,7 +51,7 @@ import process from "node:process";
 
 const SCRIPTS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const INTEGRITY_DIR = join(SCRIPTS_DIR, "integrity");
-const SUPervisor = join(SCRIPTS_DIR, "supervisor.mjs");
+const SUPervisor = join(SCRIPTS_DIR, "guard.mjs");
 
 function die(msg, code) {
   console.error(msg);
@@ -59,7 +59,7 @@ function die(msg, code) {
 }
 
 // ---------------------------------------------------------------------------
-// CLI (strict; unknown --flags are passed to supervisor.mjs verbatim)
+// CLI (strict; unknown --flags are passed to guard.mjs verbatim)
 // ---------------------------------------------------------------------------
 const RESERVABLE = new Set([
   "base", "workdir", "src", "reuse", "model", "provider", "model-base-url",
@@ -86,7 +86,7 @@ const supArgs = [];
 let task = "";
 
 function usage() {
-  console.log(`integrity/hypervisor.mjs — run supervisor.mjs in a low-integrity sandbox (no admin, no docker)
+  console.log(`integrity/hypervisor.mjs — run guard.mjs in a low-integrity sandbox (no admin, no docker)
 
 options:
   --base <dir>           sandbox root (default %USERPROFILE%\\pi-supervisor-sandbox)
@@ -106,7 +106,7 @@ options:
   --skip-latency         Skip the preflight latency probe (tok/s measurement)
   --log <file>           log file name (default pi-child-hypervisor.log in workdir)
   <task>                 positional task text
-  everything else        passed through to supervisor.mjs (see its --help)
+  everything else        passed through to guard.mjs (see its --help)
 
 examples:
   node hypervisor.mjs --model gemma-4-26B-A4B --expect-file out.txt "solve the task; write the answer to out.txt"
@@ -351,7 +351,7 @@ async function runSelftest() {
 // ---------------------------------------------------------------------------
 // The sandboxed tree gets an isolated APPDATA/HOME, so the child supervisor
 // cannot find the global pi install itself. Resolve it HERE (real env) and
-// pin it via PI_PACKAGE_DIR. Same candidate order as supervisor.mjs:
+// pin it via PI_PACKAGE_DIR. Same candidate order as guard.mjs:
 // PI_PACKAGE_DIR > npm root -g > %APPDATA%\npm.
 function resolveRealPackageDir() {
   const candidates = [];

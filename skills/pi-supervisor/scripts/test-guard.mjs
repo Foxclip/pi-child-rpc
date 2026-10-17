@@ -1,10 +1,10 @@
-// test-supervisor.mjs — static regression tests for supervisor.mjs
+// test-guard.mjs — static regression tests for guard.mjs
 //
-// Runs the real supervisor.mjs against a FAKE RpcClient: PI_PACKAGE_DIR points
+// Runs the real guard.mjs against a FAKE RpcClient: PI_PACKAGE_DIR points
 // at a scratch package whose dist/index.js exports a RpcClient that replays
 // scripted child events (no model, no network). Deterministic and fast.
 //
-// Usage: node test-supervisor.mjs
+// Usage: node test-guard.mjs
 //
 // Event script format (PI_TEST_JSON env → path to JSON file):
 //   { phases: [ [events...], [events...], ... ] }
@@ -29,7 +29,7 @@ import { fileURLToPath } from "node:url";
 import { parseIcaclsMode } from "./user/reads-probe.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const supervisorPath = join(here, "supervisor.mjs");
+const supervisorPath = join(here, "guard.mjs");
 const TASK = "task with enough length to pass the short-task warning threshold for tests";
 
 // ---------------------------------------------------------------------------
@@ -54,20 +54,24 @@ class RpcClient {
   emit(ev) { for (const h of this.handlers) h(ev); }
   async start() {
     // No replay here: nothing happens until the supervisor prompts the task.
+    // preEntries (spec) = session history already present at start (resumes).
     this.entries.push({ type: "session", id: "session-0", sessionId: "fake-session" });
+    for (const e of spec.preEntries ?? []) this.entries.push(e);
     this.emit({ type: "session_start", sessionId: "fake-session" });
   }
   async prompt(text) {
     this.prompts.push(text);
     const id = "user-" + this.entries.length;
-    this.entries.push({ type: "message", id, message: { role: "user", content: [{ type: "text", text }] } });
+    const last = this.entries[this.entries.length - 1];
+    this.entries.push({ type: "message", id, parentId: last ? last.id : null, message: { role: "user", content: [{ type: "text", text }] } });
     this.replay();
     return "accepted";
   }
   async steer(msg) {
     this.steers.push(msg);
     const id = "user-" + this.entries.length;
-    this.entries.push({ type: "message", id, message: { role: "user", content: [{ type: "text", text: msg }] } });
+    const last = this.entries[this.entries.length - 1];
+    this.entries.push({ type: "message", id, parentId: last ? last.id : null, message: { role: "user", content: [{ type: "text", text: msg }] } });
     this.replay();
     return "accepted";
   }
@@ -101,7 +105,8 @@ class RpcClient {
           this.emit({ type: "tool_execution_start", toolName: b.toolCall, args: b.args ?? {} });
         }
       }
-      this.entries.push({ type: "message", id: "asst-" + this.entries.length, message: { role: "assistant", content: blocks } });
+      const last = this.entries[this.entries.length - 1];
+      this.entries.push({ type: "message", id: "asst-" + this.entries.length, parentId: last ? last.id : null, message: { role: "assistant", content: blocks } });
     } else if (ev.toolEnd) {
       this.emit({ type: "tool_execution_end", isError: !!ev.toolEnd.isError, durationMs: ev.toolEnd.durationMs ?? 5, result: ev.toolEnd.result ?? "ok" });
     } else if (ev.writeFile) {
@@ -115,12 +120,21 @@ class RpcClient {
   }
   async abort() { this.abortCalls++; }
   async clearQueue() {}
-  async fork(checkpointId) {
-    this.forkCalls.push(checkpointId);
-    return { sessionId: "fake-forked", sessionFile: "/tmp/fake-forked.jsonl", checkpointId, cancelled: false };
+  async fork(entryId) {
+    this.forkCalls.push(entryId);
+    // Faithful to pi's RPC fork(): only user-message entries are accepted
+    // (the branch is made BEFORE them); anything else throws.
+    const e = this.entries.find((x) => x.id === entryId);
+    if (!e || e.type !== "message" || e.message?.role !== "user") {
+      throw new Error("Invalid entry ID for forking");
+    }
+    return { sessionId: "fake-forked", sessionFile: "/tmp/fake-forked.jsonl", checkpointId: entryId, cancelled: false };
   }
   async getState() { return { sessionId: "fake-session", sessionFile: "/tmp/fake-session.jsonl", entries: this.entries }; }
-  async getEntries() { return { entries: this.entries }; }
+  async getEntries() {
+    const last = this.entries[this.entries.length - 1];
+    return { entries: this.entries, leafId: last ? last.id : null };
+  }
   async getLastAssistantText() { return { text: this.lastText }; }
   async stop() {}
 }
@@ -138,10 +152,10 @@ writeFileSync(join(fakePkg, "dist", "index.js"), FAKE_INDEX);
 let passCount = 0;
 let failCount = 0;
 
-function run({ name, args = [], phases, expect = [], expectExit = 0, expectNot = [], setup = null, assertFiles = [] }) {
+function run({ name, args = [], phases, expect = [], expectExit = 0, expectNot = [], setup = null, assertFiles = [], extra = null }) {
   const dir = mkdtempSync(join(tmpdir(), "pi-sup-test-"));
   const specFile = join(dir, "script.json");
-  writeFileSync(specFile, JSON.stringify({ phases }));
+  writeFileSync(specFile, JSON.stringify({ phases, ...(extra ?? {}) }));
   if (setup) setup(dir);
   // spawnSync (not execFileSync): [supervisor]/[info] lines go to STDERR and
   // must be included in the assertions.
@@ -508,6 +522,71 @@ run({
       '"report.md": true',
     ],
   }],
+});
+
+// ---------------------------------------------------------------------------
+// v0.13.0: L1.5 auto-rewind (branch right after the task message) + --action rewind
+// ---------------------------------------------------------------------------
+run({
+  name: "tool loop → steer → loop again → L1.5 rewind → completed",
+  args: [TASK, "--loop-threshold", "3", "--max-steers", "1", "--max-rewinds", "1"],
+  phases: [
+    [...tool("bash", { cmd: "x" }), ...tool("bash", { cmd: "x" }), ...tool("bash", { cmd: "x" })],
+    [...tool("bash", { cmd: "x" }), ...tool("bash", { cmd: "x" }), ...tool("bash", { cmd: "x" })],
+    [...tool("bash", { cmd: "y" }), ...done("Recovered after rewind; report saved.")],
+  ],
+  expect: ["L1 steer", "L1.5 rewind #1/1", "\"rewinds\":1", "\"status\":\"completed\""],
+  expectNot: ["L2 fork #"],
+});
+
+run({
+  name: "--max-rewinds 0 → loop falls through to L2 fork",
+  args: [TASK, "--loop-threshold", "3", "--max-steers", "0", "--max-rewinds", "0"],
+  phases: [
+    [...tool("bash", { cmd: "x" }), ...tool("bash", { cmd: "x" }), ...tool("bash", { cmd: "x" })],
+    [...tool("bash", { cmd: "y" }), ...done("Done after fork.")],
+  ],
+  expect: ["L2 fork #1/2", "\"status\":\"completed\""],
+  expectNot: ["L1.5 rewind"],
+});
+
+run({
+  name: "consult mode: loop parks and advertises rewind",
+  args: [TASK, "--consult", "--loop-threshold", "3"],
+  phases: [
+    [...tool("bash", { cmd: "x" }), ...tool("bash", { cmd: "x" }), ...tool("bash", { cmd: "x" })],
+  ],
+  expect: ["CONSULT (loop)"],
+  expectExit: 4,
+  assertFiles: [{
+    path: "pi-child-consult.json",
+    expect: ['"trigger": "loop"', '"rewindsUsed": 0', '"maxRewinds": 1', '"rewind"', '"taskEntryId"'],
+  }],
+});
+
+run({
+  name: "--consult-file --action rewind → branch after task + re-prompt",
+  args: ["--consult-file", "c.json", "--action", "rewind", "--message", "RESENT_AFTER_REWIND"],
+  phases: [
+    [...done("Resumed after rewind.")],
+  ],
+  expect: ["rewind re-prompt", "\"rewinds\":1", "\"status\":\"completed\""],
+  expectExit: 0,
+  setup: (dir) => writeFileSync(join(dir, "c.json"), JSON.stringify({
+    v: 1, at: new Date().toISOString(), trigger: "loop",
+    allowedActions: ["rewind", "fork", "continue"],
+    task: TASK, attempt: 1, steersUsed: 1, forksUsed: 0, rewindsUsed: 0, loopsSeen: 1,
+    maxSteers: 3, maxForks: 2, maxRewinds: 1,
+    startTs: Date.now(), hardTimeoutMs: 0,
+    sessionId: "fake-session", sessionFile: "/tmp/fake-session.jsonl",
+    taskEntryId: "user-pre-1",
+  })),
+  extra: {
+    preEntries: [
+      { type: "message", id: "user-pre-1", parentId: "session-0", message: { role: "user", content: [{ type: "text", text: TASK }] } },
+      { type: "message", id: "asst-pre-2", parentId: "user-pre-1", message: { role: "assistant", content: [{ type: "text", text: "looping on the same call" }] } },
+    ],
+  },
 });
 
 console.log(`\n=== ${passCount} passed, ${failCount} failed ===`);
