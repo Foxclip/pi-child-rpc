@@ -34,6 +34,17 @@
 // Hypervisor options:
 //   --image <name>         Container image (default pi-supervisor:docker; built
 //                          from the bundled Dockerfile if missing)
+//   --dockerfile-append <file|lines>  Append Dockerfile lines (or a file's
+//                          content) to the bundled Dockerfile and run with the
+//                          derived image <image>-ext (project images: bake in
+//                          apt/pip/npm tooling once, reused across runs)
+//   --pre-run <cmd>        Run a shell command in a throwaway container of the
+//                          run image BEFORE the child starts (same /work mount,
+//                          same agent profile). For setup that must exist in
+//                          the RUNNING pi process: `pi install npm:<ext>` here
+//                          is live at launch; the same install in-session is
+//                          not (hooks load at process start).
+//   --pre-run-timeout <sec> Pre-run wall clock (default 1800; kill + fail)
 //   --docker <cmd>         Container runtime command (default: docker)
 //   --workdir <dir>        Host working directory mounted at /work (default: cwd).
 //                          The child works in /work; the progress log, session
@@ -88,6 +99,15 @@ Supervisor options are passed through unchanged; see supervisor.mjs --help.
 
 Hypervisor options:
   --image <name>         Container image (default pi-supervisor:docker)
+  --dockerfile-append <file|lines>  Append Dockerfile lines (or a file's content)
+                        to the bundled Dockerfile; run with the derived image
+                        <image>-ext (project images: bake tooling once, reuse)
+  --pre-run <cmd>        Shell command in a throwaway container BEFORE the
+                        child starts (same /work mount, same agent profile).
+                        For setup that must be live in the RUNNING pi process
+                        (e.g. pi install npm:<ext> here is live at launch; the
+                        same install in-session is not).
+  --pre-run-timeout <sec> Pre-run wall clock (default 1800)
   --docker <cmd>         Container runtime (default: docker)
   --workdir <dir>        Host dir mounted at /work (default: cwd)
   --model-base-url <u>   Model URL from the CONTAINER (default http://host.docker.internal:8081/v1)
@@ -123,7 +143,8 @@ const SUP_VALUE = new Set([
 ]);
 const SUP_BOOL = new Set(["--no-session", "--consult", "--keep-question-tool", "--keep-delegate-tool"]);
 const HY_VALUE = new Set([
-  "--image", "--docker", "--workdir", "--model-base-url", "--api-key",
+  "--image", "--dockerfile-append", "--pre-run", "--pre-run-timeout", "--docker",
+  "--workdir", "--model-base-url", "--api-key",
   "--context-window", "--model-input", "--forward-from", "--forward-to", "--restarts",
   "--no-progress", "--log",
 ]);
@@ -139,6 +160,9 @@ let task = "";
 let sawTaskFile = false;
 const opt = {
   image: "pi-supervisor:docker",
+  dockerfileAppend: "",
+  preRun: "",
+  preRunTimeoutSec: 1800,
   docker: "docker",
   workdir: process.cwd(),
   modelBaseUrl: "http://host.docker.internal:8081/v1",
@@ -196,6 +220,9 @@ for (let i = 0; i < argv.length; i++) {
     if (v === undefined) die(`error: ${a} requires a value`, 2);
     switch (a) {
       case "--image": opt.image = v; break;
+      case "--dockerfile-append": opt.dockerfileAppend = v; break;
+      case "--pre-run": opt.preRun = v; break;
+      case "--pre-run-timeout": opt.preRunTimeoutSec = Number(v) || 0; break;
       case "--docker": opt.docker = v; break;
       case "--workdir": opt.workdir = resolve(v); break;
       case "--model-base-url": opt.modelBaseUrl = v; break;
@@ -255,6 +282,7 @@ if (!opt.model) die("error: no model — pass --model or set $PI_MODEL", 2);
 if (!opt.apiKey) opt.apiKey = opt.provider;
 if (opt.contextWindow <= 0) die("error: --context-window must be > 0", 2);
 if (opt.restarts < 0) die("error: --restarts must be >= 0", 2);
+if (opt.preRun && opt.preRunTimeoutSec <= 0) die("error: --pre-run-timeout must be > 0", 2);
 
 // --model-input: input modalities to declare in the container's models.json.
 // Without an explicit declaration pi uses its default for the entry; a
@@ -421,6 +449,67 @@ function ensureImage() {
     stdio: ["ignore", "inherit", "inherit"],
   });
   if (r.status !== 0) die(`error: docker build failed (exit ${r.status})`, 1);
+}
+
+// --dockerfile-append: derive a project image (bundled Dockerfile + your
+// lines) and switch the run to it. Docker's layer cache makes unchanged-base
+// rebuilds cheap; the generated Dockerfile is left in the agent dir (host-
+// visible) for inspection.
+function buildAppendImage() {
+  let extra = opt.dockerfileAppend;
+  const f = resolve(extra);
+  if (existsSync(f) && statSync(f).isFile()) extra = readFileSync(f, "utf8");
+  const base = readFileSync(join(dockerDir, "Dockerfile"), "utf8");
+  const gen = join(agentDirHost, "Dockerfile.ext");
+  mkdirSync(agentDirHost, { recursive: true });
+  writeFileSync(gen, base.replace(/\n?$/, "\n") +
+    "\n# --- pi-supervisor --dockerfile-append (regenerated each launch; do not edit) ---\n" +
+    extra.replace(/\n?$/, "\n"));
+  const tag = `${opt.image}-ext`;
+  log(`dockerfile-append: building derived image ${tag} from ${winPath(gen)}`);
+  const r = spawnSync(opt.docker, ["build", "-f", winPath(gen), "-t", tag, winPath(dockerDir)], {
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  if (r.status !== 0) die(`error: docker build of ${tag} failed (exit ${r.status}) — check the appended Dockerfile lines`, 1);
+  opt.image = tag;
+  log(`derived image ${tag} ready — pre-run and the main container use it`);
+}
+
+// --pre-run: one throwaway container of the run image, before the child
+// exists. Same /work mount and PI_CODING_AGENT_DIR, so `pi install` lands in
+// the profile the main run loads (hooks are live at launch) and files written
+// to /work survive. Fails the launch on non-zero exit or timeout.
+async function preRun() {
+  if (!opt.preRun) return;
+  const name = `${containerName}-pre`;
+  const args = ["run", "--rm", "--name", name, "-i",
+    "-v", `${winPath(workdir)}:/work`,
+    "--add-host=host.docker.internal:host-gateway",
+    "-e", `PI_CODING_AGENT_DIR=${agentDirC}`,
+    opt.image, "bash", "-lc", opt.preRun];
+  log(`pre-run: ${opt.docker} ${args.slice(0, args.length - 3).join(" ")} <${opt.preRun.length}-char command>`);
+  const t0 = Date.now();
+  const code = await new Promise((res) => {
+    const proc = spawn(opt.docker, args, { cwd: workdir, stdio: ["ignore", "inherit", "inherit"], env: process.env });
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      log(`pre-run: timed out after ${opt.preRunTimeoutSec}s — killing container`);
+      spawnSync(opt.docker, ["kill", name], { stdio: "ignore" });
+      try { proc.kill("SIGKILL"); } catch { /* gone */ }
+      res(124);
+    }, opt.preRunTimeoutSec * 1000);
+    proc.on("close", (c) => { if (settled) return; settled = true; clearTimeout(timer); res(c ?? 1); });
+    proc.on("error", () => { if (settled) return; settled = true; clearTimeout(timer); res(125); });
+  });
+  const secs = Math.round((Date.now() - t0) / 1000);
+  // Best-effort cleanup if the timeout path raced docker's --rm reap.
+  spawnSync(opt.docker, ["rm", "-f", name], { stdio: "ignore" });
+  if (code === 124) die(`error: --pre-run timed out after ${opt.preRunTimeoutSec}s (raise --pre-run-timeout or shorten the command)`, 1);
+  if (code === 125) die(`error: --pre-run: docker spawn failed (is the image ${opt.image} present?)`, 1);
+  if (code !== 0) die(`error: --pre-run exited ${code} in ${secs}s — not launching the child (fix the setup command or drop --pre-run)`, 1);
+  log(`pre-run ok in ${secs}s`);
 }
 
 // ---------------------------------------------------------------------------
@@ -597,7 +686,8 @@ async function main() {
   log(`workdir=${winPath(workdir)} image=${opt.image} provider=${opt.provider} model=${opt.model}`);
   log(`container model url=${opt.modelBaseUrl} host-side url=${hostModelBaseUrl()}`);
   writeAgentConfig();
-  ensureImage();
+  if (opt.dockerfileAppend) buildAppendImage(); else ensureImage();
+  await preRun();
   await startForwarder();
 
   if (!opt.skipHealth) {

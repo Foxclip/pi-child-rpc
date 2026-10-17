@@ -47,6 +47,17 @@ as it is done (do not batch at the end):
   report — the host is sealed from your profile and cannot inspect it.
 - If you are killed or interrupted: on the next turn, write the (partial)
   report BEFORE doing anything else.
+- If the task is to test an extension/plugin: verify it is LOADED IN THE
+  RUNNING PROCESS, not merely installed (`pi list` / package presence is not
+  proof — hooks load at process start). Report "live vs installed-only" as a
+  distinct status; results from running the package's modules directly are
+  module results, not extension results.
+- Write large temp files to the working directory, not `/tmp` or `%TEMP%` —
+  the workdir is persistent, host-visible, and where artifacts belong; /tmp
+  may be small and dies with the container.
+- Keep single tool calls to ~5 min or less: chunk long operations (per-segment
+  ASR, per-range downloads) so progress stays observable in the status file
+  and the work stays resumable if a call is lost.
 - Do not ask the user questions. Do not spawn sub-agents.
 
 ## Report protocol

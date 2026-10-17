@@ -144,6 +144,7 @@ A long autonomous task is a *contract*, not a suggestion. Every failure in this 
 
 - **Verify on launch, before walking away.** The first `[supervisor] task: N chars — "..."` line in the log is the task the child *actually received*. Read it. A typo'd `--flag` (now exit 2) or a truncated task used to become the child's entire task, and the run would "complete" doing nothing in 6 minutes.
 - **One blocking wait, not polling.** For a run with a known budget, run the supervisor in the **foreground of a single bash call** with the call's timeout matched to the budget; the call returns exactly at run end and the last line of the log is the RESULT JSON. Mid-run status comes from the progress log, not from re-running anything.
+- **Host silence during runs (local models).** A `parallel=1` model server serializes host and child requests, and every context switch pays a prefill — host turns measurably slow the child (and vice versa). SOP: only long blocking waits (15–20 min) while a child runs; do all host-side analysis after it exits.
 - **The progress log is the status surface.** `pi-child-progress.log` (path in the `[start]` line and in RESULT's `progressLog`): one line per completed tool call plus `[settled]`/`[result]` summary lines. A peek is a `tail` on a small file — no 20 MB session-jsonl parsing, no custom scripts.
 - **The result manifest is the exit surface.** `pi-child-result.json` in the working directory (always written, every outcome including consult/stuck): the full RESULT payload + run metadata. At the end of a run, read this one small file, not the log.
 - **Multi-hour runs: `--consult --heartbeat <N>` for structured monitoring.** Instead of ad-hoc log tailing, the supervisor parks every N completed tool calls and hands you the recent trace (the payload includes the last tool calls with args/results + the child's last text). Each heartbeat = one parent turn + child restart (it re-reads its transcript), so keep N large (≥30; much larger on slow local models).
@@ -161,6 +162,7 @@ Field lessons from real long runs — including a 240-minute run on a ~0.5 tok/s
 - Declare vision if the task needs it (all variants; v0.11.0 user, v0.11.1 docker + integrity): `--model-input text,image` writes the modalities into the child's models.json. Without it pi's default declaration applies — a text-only default means the child CANNOT be fed images even when the server supports them, and nothing warns about it. Verify what landed: user variant → `.pi-child-env.json` (project dir, see After the run); docker/integrity → the `input=…` field of the `agent config` line in `pi-child-hypervisor.log`.
 - Measure the model: the hypervisors all run a preflight latency probe and log tok/s (`--skip-latency` to skip). Then budget: Σ(per-item timebox) ≤ `--timeout`. A run where N items × T min > the hard timeout is mathematically doomed before launch — reduce N, raise `--timeout`, or split the run.
 - Verify the child's toolchain deps (ffmpeg, venvs, writable temp dirs — see child-environment gotchas below).
+- **Probe input artifacts through the child's namespace, not the host's.** Host fs and child fs are different universes (docker `/work` mount, user-variant ACLs, integrity sandbox), so a host-side probe of a file the child will read is only valid where the child reads it: docker → `docker run --rm <image> ffprobe /work/x.mp4`; user variant → over the loopback SSH. Never pass host-side file facts to the task as ground truth — pass paths and let the child's "verify first" section produce the ground truth (2026-10-17: a host probe of a 4h video reported the wrong duration and content; the child's in-environment probe was right).
 
 **Task contract (beyond the authoring rules above):**
 - Incremental artifacts: one line per sub-item to a results file immediately (`--expect-file` for the final report).
@@ -242,6 +244,9 @@ Hypervisor-only:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--image <name>` | `pi-supervisor:docker` | container image; built from the bundled Dockerfile if missing |
+| `--dockerfile-append <file\|lines>` | off | append Dockerfile lines (or a file's content) to the bundled Dockerfile and run with the derived image `<image>-ext` (project images) |
+| `--pre-run <cmd>` | off | shell command in a throwaway container BEFORE the child starts (same `/work` mount, same agent profile); fails the launch on non-zero exit |
+| `--pre-run-timeout <sec>` | `1800` | pre-run wall clock; kill + fail on expiry |
 | `--docker <cmd>` | `docker` | container runtime command |
 | `--workdir <dir>` | cwd | host dir mounted at `/work`; child works there |
 | `--model-base-url <u>` | `http://host.docker.internal:8081/v1` | model URL **from the container** |
@@ -259,6 +264,30 @@ Hypervisor-only:
 | `--no-progress <sec>` | `2700` | kill+restart after this much total silence in the progress log; `0` disables. Must exceed the supervisor's `--tool-timeout` — a single long tool call is legitimate silence |
 | `--keep-container` | off | do not `--rm` the container on exit |
 | `--log <path>` | `pi-child-hypervisor.log` in workdir | hypervisor log |
+
+### Pre-start setup and project images (v0.12.0)
+
+Two knobs for setup that must exist **before the child's pi process starts**
+(both operate on the image the main container then uses):
+
+- **`--pre-run <cmd>`** — one throwaway container of the run image, same
+  `/work` mount and agent profile, before the child exists. The case it
+  exists for: **pi extensions load at process start** — a `pi install` inside
+  the session does NOT activate hooks in the running pi process (2026-10-17
+  long-video run: pi-sense installed in-session had dead hooks, so its
+  extension-flow verdict was partly a method artifact). Put installs in
+  `--pre-run "pi install npm:x && pi install npm:y"` and they are live at
+  launch. Files written to `/work` survive into the run. Non-zero exit fails
+  the launch — the child never starts into a broken setup.
+- **`--dockerfile-append <file|lines>`** — build a project image (bundled
+  Dockerfile + your lines, tag `<image>-ext`) and run with it, e.g.
+  `--dockerfile-append "RUN apt-get update && apt-get install -y ffmpeg python3-venv"`
+  (multi-line: pass a file path). The generated Dockerfile is left at
+  `<workdir>/.pi-docker/agent/Dockerfile.ext`. Recurring tooling (ffmpeg,
+  faster-whisper venvs, datasets) belongs in the image, not in the task — the
+  first long-video run spent 5+ child calls re-doing `apt-get` + venv setup
+  that belongs in an image layer. (Plain `--image <name>` also works: build a
+  `FROM pi-supervisor:docker` image yourself.)
 
 ### Monitoring (host side)
 
