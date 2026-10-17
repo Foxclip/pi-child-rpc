@@ -63,8 +63,8 @@ function die(msg, code) {
 // ---------------------------------------------------------------------------
 const RESERVABLE = new Set([
   "base", "workdir", "src", "reuse", "model", "provider", "model-base-url",
-  "api-key", "context-window", "task", "selftest", "log", "skip-latency",
-  "help", "h",
+  "api-key", "context-window", "model-input", "task", "selftest", "log",
+  "skip-latency", "help", "h",
 ]);
 const opt = {
   base: process.env.USERPROFILE ? join(process.env.USERPROFILE, "pi-supervisor-sandbox") : join(process.cwd(), "pi-supervisor-sandbox"),
@@ -76,6 +76,7 @@ const opt = {
   modelBaseUrl: "http://127.0.0.1:8080/v1",
   apiKey: "local",
   contextWindow: 262144,
+  modelInput: "",
   task: "",
   selftest: false,
   log: "pi-child-hypervisor.log",
@@ -97,6 +98,9 @@ options:
   --model-base-url <u>   model endpoint (default http://127.0.0.1:8080/v1)
   --api-key <k>          (default "local")
   --context-window <n>   (default 262144)
+  --model-input <csv>    input modalities to declare in the child's models.json
+                         (comma list, e.g. "text,image"; without it pi's
+                         default declaration applies)
   --task <text>          task text (or first positional)
   --selftest             verify downgrade + isolation, then exit
   --skip-latency         Skip the preflight latency probe (tok/s measurement)
@@ -138,6 +142,7 @@ for (let i = 0; i < argv.length; i++) {
     case "model-base-url": opt.modelBaseUrl = v; break;
     case "api-key": opt.apiKey = v; break;
     case "context-window": opt.contextWindow = Number(v) || 0; break;
+    case "model-input": opt.modelInput = v; break;
     case "task": opt.task = v; break;
     case "selftest": opt.selftest = true; break;
     case "log": opt.log = v; break;
@@ -148,6 +153,17 @@ for (let i = 0; i < argv.length; i++) {
 if (opt.task) task = opt.task;
 if (!task && !opt.selftest) { usage(); die("error: no task (positional or --task)", 2); }
 if (opt.contextWindow <= 0) die("error: --context-window must be > 0", 2);
+
+// --model-input: input modalities to declare in the child's models.json
+// (same rationale as the docker/user variants — a text-only default hides
+// vision from the child even when the endpoint supports it).
+const MODEL_INPUTS = new Set(["text", "image", "audio", "video"]);
+let modelInputs = [];
+if (opt.modelInput) {
+  modelInputs = opt.modelInput.split(",").map((s) => s.trim()).filter(Boolean);
+  const bad = modelInputs.find((m) => !MODEL_INPUTS.has(m));
+  if (bad) die(`error: --model-input "${bad}" is not a known input modality (valid: ${[...MODEL_INPUTS].join(", ")})`, 2);
+}
 if (!opt.workdir) opt.workdir = join(opt.base, "work");
 if (!opt.model && !opt.selftest) die("error: no model — pass --model or set $PI_MODEL", 2);
 
@@ -218,6 +234,7 @@ function writeAgentConfig() {
           reasoning: false,
           contextWindow: opt.contextWindow,
           maxTokens: opt.contextWindow,
+          ...(modelInputs.length > 0 ? { input: modelInputs } : {}),
         }],
       },
     },
@@ -243,7 +260,7 @@ function writeAgentConfig() {
     shell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
   }
   writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ shellPath: shell }, null, 2));
-  log(`agent config: ${agentDir}/models.json (provider=${opt.provider}, model=${opt.model}, baseUrl=${opt.modelBaseUrl})`);
+  log(`agent config: ${agentDir}/models.json (provider=${opt.provider}, model=${opt.model}, baseUrl=${opt.modelBaseUrl}, input=${modelInputs.length > 0 ? modelInputs.join(",") : "pi default"})`);
   log(`bash tool shell (shellPath): ${shell}`);
 }
 

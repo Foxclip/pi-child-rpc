@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.11.1 — 2026-10-17
+
+**`--model-input` ported to the docker and integrity variants** — v0.11.0 only
+had it in the user variant, but the same silent text-only-default failure
+applies wherever the hypervisor writes the child's models.json.
+
+- `docker/hypervisor.mjs` + `integrity/hypervisor.mjs`: `--model-input <csv>`
+  (validated against text,image,audio,video, invalid value → exit 2, same
+  error text as the user variant) → written into the generated models.json
+  model entry as `input: [...]`. The `agent config` log line now carries an
+  `input=<csv|pi default>` field so the host can verify the declaration
+  without reading the sealed/generated config.
+- SKILL.md: docker + integrity flag tables gained the row; the preflight
+  "declare vision" bullet now covers all variants with per-variant verify
+  pointers (user → `.pi-child-env.json`; docker/integrity → hypervisor log).
+
 ## v0.11.0 — 2026-10-17
 
 **Monitoring + task-file + child-env visibility** — learned from the round-3

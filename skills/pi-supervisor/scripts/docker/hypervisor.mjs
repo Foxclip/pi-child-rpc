@@ -95,6 +95,11 @@ Hypervisor options:
   --model <m>            Model id (default $PI_MODEL)
   --api-key <key>        Endpoint key (default: provider id)
   --context-window <n>   Declared context window / max output (default 262144)
+  --model-input <csv>    Input modalities to declare for the model in the
+                        container's models.json (comma list, e.g. "text,image").
+                        Without it the model gets pi's default declaration —
+                        on a text-only declaration the child cannot be fed
+                        images/video even if the endpoint supports them.
   --forward-from <port>  Forwarder host port (default 8081)
   --forward-to <h:p>     Forwarder host target (default 127.0.0.1:8080)
   --no-forward           Skip the forwarder
@@ -119,7 +124,7 @@ const SUP_VALUE = new Set([
 const SUP_BOOL = new Set(["--no-session", "--consult", "--keep-question-tool", "--keep-delegate-tool"]);
 const HY_VALUE = new Set([
   "--image", "--docker", "--workdir", "--model-base-url", "--api-key",
-  "--context-window", "--forward-from", "--forward-to", "--restarts",
+  "--context-window", "--model-input", "--forward-from", "--forward-to", "--restarts",
   "--no-progress", "--log",
 ]);
 const HY_BOOL = new Set([
@@ -140,6 +145,7 @@ const opt = {
   model: "",
   apiKey: "",
   contextWindow: 262144,
+  modelInput: "",
   forwardFrom: 8081,
   forwardTo: "127.0.0.1:8080",
   noForward: false,
@@ -190,6 +196,7 @@ for (let i = 0; i < argv.length; i++) {
       case "--model-base-url": opt.modelBaseUrl = v; break;
       case "--api-key": opt.apiKey = v; break;
       case "--context-window": opt.contextWindow = Number(v) || 0; break;
+      case "--model-input": opt.modelInput = v; break;
       case "--forward-from": opt.forwardFrom = Number(v) || 0; break;
       case "--forward-to": opt.forwardTo = v; break;
       case "--restarts": opt.restarts = Number(v); break;
@@ -243,6 +250,19 @@ if (!opt.model) die("error: no model — pass --model or set $PI_MODEL", 2);
 if (!opt.apiKey) opt.apiKey = opt.provider;
 if (opt.contextWindow <= 0) die("error: --context-window must be > 0", 2);
 if (opt.restarts < 0) die("error: --restarts must be >= 0", 2);
+
+// --model-input: input modalities to declare in the container's models.json.
+// Without an explicit declaration pi uses its default for the entry; a
+// text-only default means the child cannot be fed images/video even when the
+// endpoint supports them. Declaring vision on a text-only endpoint is the
+// user's call (the request simply fails at runtime, visibly).
+const MODEL_INPUTS = new Set(["text", "image", "audio", "video"]);
+let modelInputs = [];
+if (opt.modelInput) {
+  modelInputs = opt.modelInput.split(",").map((s) => s.trim()).filter(Boolean);
+  const bad = modelInputs.find((m) => !MODEL_INPUTS.has(m));
+  if (bad) die(`error: --model-input "${bad}" is not a known input modality (valid: ${[...MODEL_INPUTS].join(", ")})`, 2);
+}
 
 // ---------------------------------------------------------------------------
 // Paths + logging
@@ -417,6 +437,7 @@ function writeAgentConfig() {
           reasoning: false,
           contextWindow: opt.contextWindow,
           maxTokens: opt.contextWindow,
+          ...(modelInputs.length > 0 ? { input: modelInputs } : {}),
         }],
       },
     },
@@ -424,7 +445,7 @@ function writeAgentConfig() {
   const auth = { [opt.provider]: { type: "api_key", key: opt.apiKey } };
   writeFileSync(join(agentDirHost, "models.json"), JSON.stringify(models, null, 2));
   writeFileSync(join(agentDirHost, "auth.json"), JSON.stringify(auth, null, 2));
-  log(`agent config written: ${winPath(agentDirHost)}/models.json (provider=${opt.provider}, model=${opt.model}, baseUrl=${opt.modelBaseUrl})`);
+  log(`agent config written: ${winPath(agentDirHost)}/models.json (provider=${opt.provider}, model=${opt.model}, baseUrl=${opt.modelBaseUrl}, input=${modelInputs.length > 0 ? modelInputs.join(",") : "pi default"})`);
 }
 
 // ---------------------------------------------------------------------------

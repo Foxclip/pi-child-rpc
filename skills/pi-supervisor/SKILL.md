@@ -158,7 +158,7 @@ Field lessons from real long runs — including a 240-minute run on a ~0.5 tok/s
 
 **Preflight (host side, before launch — cheap checks the child cannot do for you):**
 - Verify every external package/model/credential the task references *by name* (`npm view <pkg> version`, endpoint model list). A 2026-10-16 run lost 30+ minutes to discovering that 4 of 6 candidate package names were 404s on npm.
-- Declare vision if the task needs it (user variant, v0.11.0): `--model-input text,image` writes the modalities into the child's models.json. Without it pi's default declaration applies — a text-only default means the child CANNOT be fed images even when the server supports them, and nothing warns about it. Verify what landed in `.pi-child-env.json` (project dir, see After the run) shortly after launch.
+- Declare vision if the task needs it (all variants; v0.11.0 user, v0.11.1 docker + integrity): `--model-input text,image` writes the modalities into the child's models.json. Without it pi's default declaration applies — a text-only default means the child CANNOT be fed images even when the server supports them, and nothing warns about it. Verify what landed: user variant → `.pi-child-env.json` (project dir, see After the run); docker/integrity → the `input=…` field of the `agent config` line in `pi-child-hypervisor.log`.
 - Measure the model: the hypervisors all run a preflight latency probe and log tok/s (`--skip-latency` to skip). Then budget: Σ(per-item timebox) ≤ `--timeout`. A run where N items × T min > the hard timeout is mathematically doomed before launch — reduce N, raise `--timeout`, or split the run.
 - Verify the child's toolchain deps (ffmpeg, venvs, writable temp dirs — see child-environment gotchas below).
 
@@ -249,6 +249,7 @@ Hypervisor-only:
 | `--model <m>` | `$PI_MODEL` | model id |
 | `--api-key <key>` | provider id | key written for the endpoint (local servers ignore it) |
 | `--context-window <n>` | `262144` | declared context window and max output |
+| `--model-input <csv>` | pi's default declaration | input modalities written into the model entry (text,image,audio,video) — declare vision or the child is silently text-only |
 | `--forward-from <port>` | `8081` | host port of the model forwarder |
 | `--forward-to <h:p>` | `127.0.0.1:8080` | host target the forwarder pipes to |
 | `--no-forward` | off | skip the forwarder (model already reachable from the container) |
@@ -369,6 +370,7 @@ the downgrade itself fails.
 | `--model <id>` / `--provider <id>` | model id / provider id (the child gets its own fresh agent dir, so `localllama` never collides) | `$PI_MODEL` / `localllama` |
 | `--model-base-url <u>` | model endpoint | `http://127.0.0.1:8080/v1` |
 | `--context-window <n>` | context window written into the child's models.json | 262144 |
+| `--model-input <csv>` | input modalities written into the model entry (text,image,audio,video) | pi's default declaration |
 | `--task <t>` / positional | task text | required |
 | `--selftest` | run the isolation selftest and exit | off |
 | `--skip-latency` | skip the preflight latency probe (timed 16-token completion; logs tok/s) | off |
